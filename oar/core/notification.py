@@ -1,22 +1,24 @@
 import os
+import re
 import smtplib
+import logging
 import oar.core.util as util
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from oar.core.config_store import ConfigStore
+from oar.core.configstore import ConfigStore
 from oar.core.exceptions import NotificationException
-from oar.core.worksheet_mgr import TestReport
-from oar.core.jira_mgr import JiraManager
+from oar.core.worksheet import TestReport
+from oar.core.jira import JiraManager
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-import logging
+
 
 logger = logging.getLogger(__name__)
 
 
 class NotificationManager:
     """
-    NotifiationManager will be used to notificate messages via email or slack.
+    NotificationManager is used to send notification messages via email or slack.
     """
 
     def __init__(self, cs: ConfigStore):
@@ -33,7 +35,7 @@ class NotificationManager:
 
     def share_new_report(self, report: TestReport):
         """
-        Send email and slack messgae for new report info
+        Send email and slack message for new report info
 
         Args:
             report (TestReport): newly created test report
@@ -225,7 +227,8 @@ class MailClient:
                 self.from_addr, to_addrs.split(","), message.as_string()
             )
             if len(senderrs):
-                logger.warn(f"someone in the to_list is rejected: {senderrs}")
+                logger.warning(
+                    f"someone in the to_list is rejected: {senderrs}")
         except smtplib.SMTPException as se:  # catch all the exceptions here
             raise NotificationException("send email failed") from se
         finally:
@@ -261,13 +264,14 @@ class SlackClient:
         Returns:
             str: slack user id
         """
+        email = self.transform_email(email)
         try:
             resp = self.client.api_call(
                 api_method="users.lookupByEmail", params={"email": email}
             )
             userid = resp["user"]["id"]
         except SlackApiError as e:
-            logger.warn(f"cannot get slack user id for <{email}>: {e}")
+            logger.warning(f"cannot get slack user id for <{email}>: {e}")
             return email
 
         return "<@%s>" % userid
@@ -301,6 +305,19 @@ class SlackClient:
                 f"cannot find slack group id by name {name}")
 
         return "<!subteam^%s>" % ret_id
+
+    def transform_email(self, email):
+        '''
+        Email id in JIRA profile is not same as slack profile, 
+        e.g. in JIRA it's xxx+jira, in slack it's xxx
+        '''
+        at_index = email.find('@')
+        before_at = email[:at_index]
+        if re.search(r'\+\w+', before_at):
+            cleaned_part = re.sub(r'\+\w+', '', before_at)
+            return cleaned_part + email[at_index:]
+        else:
+            return email
 
 
 class MessageHelper:
@@ -456,7 +473,7 @@ class MessageHelper:
         self, dropped_bugs, must_verify_bugs
     ):
         """
-        manipulate slacke message for dropped bugs and must verified bugs
+        manipulate slack message for dropped bugs and must verified bugs
 
         Args:
             dropped_bugs ([]): list of dropped bugs
@@ -479,7 +496,7 @@ class MessageHelper:
 
         if len(must_verify_bugs):
             message += "\n" if len(message) else ""
-            message += f"[{self.cs.release}] Hello {gid}, following bugs are Critical/CVE Tracker/Customer Case, must be verified, if any of them can be dropped, let us (#release-tests) know, thanks\n"
+            message += f"[{self.cs.release}] Hello {gid}, following bugs are Critical/CVE Tracker/Customer Case, must be verified, if any of them can be dropped, do it manually, thanks\n"
             for bug in must_verify_bugs:
                 message += self._to_link(util.get_jira_link(bug), bug) + "\n"
 

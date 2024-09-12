@@ -5,7 +5,7 @@ import requests
 from requests.exceptions import RequestException
 from requests.exceptions import InvalidJSONError
 from oar.core.const import *
-from oar.core.worksheet_mgr import WorksheetManager
+from oar.core.worksheet import WorksheetManager
 import time
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ def get_image_digest(url, current_try=0):
             return
         else:
             logger.debug(f"Current try: {current_try}")
-            logger.warn(
+            logger.warning(
                 f"E001: No image digest found, going to retry after {sleep_time} seconds"
             )
             time.sleep(sleep_time)

@@ -272,6 +272,11 @@ class JobController:
                 # This logic only supports upgrade from latest stable version of current release e.g. from 4.16.3 to latest nightly
                 latest_stable_build = self.get_current_build(
                     build_file=self._build_file_for_stable)
+                if not latest_stable_build:
+                    # if no stable build found, it is possible that controller is running for nightly first.
+                    # so stable build file is not created, we need to intiialize it in runtime
+                    latest_stable_build = JobController(
+                        self._release, False, False, self._arch).get_latest_build()
                 prow_job_id = self.job_api.run_job(
                     job_name=test_job.prow_job, upgrade_to=build.pull_spec, upgrade_from=latest_stable_build.pull_spec, payload=None)
             else:
@@ -639,7 +644,7 @@ class TestMetrics():
         return self._successful_required
 
     def is_qe_accepted(self):
-        return self.successful_required.value == self.required.value
+        return self.required.value > 0 and self.successful_required.value > 0 and self.successful_required.value == self.required.value
 
     def all_jobs_are_completed(self):
         return self.total.value > 0 and self.completed.value > 0 and self.total.value == self.completed.value
@@ -672,7 +677,7 @@ class TestResultAggregator():
                 nightly = "nightly" in file_name
                 # get build number from file name
                 build = re.search(
-                    r'\d.*\d', file_name[:file_name.index(self._arch)]).group()
+                    r'\d.*\d', file_name[:file_name.rfind(self._arch)]).group()
                 # if the nightly build is recycled/cannot be found on releasestream, will skip aggregation and delete test result file
                 if nightly and self.build_does_not_exists(build, self._arch):
                     logger.info(f"build {build} is recycled, skip aggregation")
@@ -696,6 +701,11 @@ class TestResultAggregator():
                     # if it's true, the job result will not be used to determine build is QE accepted
                     job_metadata = self.job_registry.get_test_job(
                         release, nightly, job_result.job_name)
+                    # if job definition is removed from job registry, skip this job and continue
+                    if not job_metadata:
+                        logger.warning(
+                            f"skip aggreation for job run of {job_result.job_name}")
+                        continue
 
                     # if first job is failed and it's not optional we will start to trigger retry jobs
                     # according to `retries` attribute defined in job registry

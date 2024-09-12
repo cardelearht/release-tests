@@ -1,14 +1,14 @@
 import gspread
-import gspread_formatting
 import os
+import re
 import logging
 import oar.core.util as util
-from oar.core.exceptions import WorksheetException
+from oar.core.exceptions import WorksheetException, WorksheetExistsException
 from oar.core.exceptions import JiraUnauthorizedException
-from oar.core.config_store import ConfigStore
+from oar.core.configstore import ConfigStore
 from oar.core.const import *
-from oar.core.advisory_mgr import AdvisoryManager, Advisory
-from oar.core.jira_mgr import JiraManager
+from oar.core.advisory import AdvisoryManager
+from oar.core.jira import JiraManager
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import *
 from gspread import Worksheet
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 class WorksheetManager:
     """
-    WorksheetManager will be used to update test report with info provided by ConfigStore
+    WorksheetManager is used to update test report with info provided by ConfigStore
     """
 
     def __init__(self, cs: ConfigStore):
@@ -68,9 +68,9 @@ class WorksheetManager:
             try:
                 existing_sheet = self._doc.worksheet(self._cs.release)
                 if existing_sheet:
-                    raise WorksheetException(
-                        f"test report of {self._cs.release} already exists, url: {existing_sheet.url}"
-                    )
+                    logger.info(
+                        f"test report of {self._cs.release} already exists, url: {existing_sheet.url}")
+                    raise WorksheetExistsException()
             except WorksheetNotFound:
                 new_sheet = self._doc.duplicate_sheet(self._template.id)
                 new_sheet.update_title(self._cs.release)
@@ -321,7 +321,7 @@ class TestReport:
         for key in jira_issues:
             try:
                 issue = jm.get_issue(key)
-            except JiraUnauthorizedException:  # jira token does not have pemission to access security bugs, ignore it
+            except JiraUnauthorizedException:  # jira token does not have permission to access security bugs, ignore it
                 continue
             logger.debug(f"updating jira issue {key} ...")
             if issue.is_on_qa():
@@ -459,7 +459,7 @@ class TestReport:
         Append missed cve tracker bugs
         """
         if len(cve_tracker_bugs) == 0:
-            logger.warn("no cve bugs found, won't update report")
+            logger.warning("no cve bugs found, won't update report")
             return
 
         row_idx = 8
@@ -467,6 +467,14 @@ class TestReport:
             cell_value = self._ws.acell("F" + str(row_idx)).value
             if not cell_value:
                 break
+            else:
+                # check whether track bug is already there, remove it from the list
+                match = re.search(r'OCPBUGS-\d+', cell_value)
+                if match:
+                    bug = match.group(0)
+                    logger.info(
+                        f"found existing CVE tracker bug {bug} in report")
+                    cve_tracker_bugs.remove(bug)
             row_idx += 1
 
         for bug in cve_tracker_bugs:
@@ -475,6 +483,10 @@ class TestReport:
             )
             row_idx += 1
             logger.info(f"append missed CVE tracker bug {bug} to test report")
+
+        # if cve_tracker_bugs list is not empty, it means a new tracker bug is found
+        # we need to send out notification
+        return len(cve_tracker_bugs) > 0
 
     def _to_hyperlink(self, link, label):
         return f'=HYPERLINK("{link}","{label}")'
