@@ -1,10 +1,11 @@
-import click
 import logging
-from oar.core.worksheet import WorksheetManager
-from oar.core.advisory import AdvisoryManager
-from oar.core.configstore import ConfigStore
-from oar.core.notification import NotificationManager
+
+import click
+
 from oar.core.const import *
+from oar.core.notification import NotificationManager
+from oar.core.operators import BugOperator
+from oar.core.worksheet import WorksheetManager
 
 logger = logging.getLogger(__name__)
 
@@ -14,29 +15,31 @@ logger = logging.getLogger(__name__)
 def drop_bugs(ctx):
     """
     Drop bugs from advisories
+
+    If new pre-merge verification method is active, we only pick up verified bugs to shipment resource
+    QE leads don't have to drop bugs
     """
     # get config store from context
     cs = ctx.obj["cs"]
     try:
         # get existing report
         report = WorksheetManager(cs).get_test_report()
-        # init advisory manager
-        am = AdvisoryManager(cs)
+        # init bug operator
+        operator = BugOperator(cs)
         # update task status to in progress
         report.update_task_status(LABEL_TASK_DROP_BUGS, TASK_STATUS_INPROGRESS)
         # check doc and product security approval advisories
-        approved_doc_ads, approved_prodsec_ads = am.get_doc_prodsec_approved_ads()
-        dropped_bugs, must_verify_bugs = am.drop_bugs()
+        # TODO: need to confirm how to collabrate with doc and prodsec team
+        approved_doc_ads, approved_prodsec_ads = operator._am.get_doc_prodsec_approved_ads()
+        dropped_bugs = operator.drop_bugs()
         # check if all bugs are verified
         nm = NotificationManager(cs)
         requested_doc_ads = []
         requested_prodsec_ads = []
-        if len(dropped_bugs) or len(must_verify_bugs):
+        if len(dropped_bugs):
             logger.info("updating test report")
-            report.update_bug_list(am.get_jira_issues())
-            NotificationManager(cs).share_dropped_and_must_verify_bugs(
-                dropped_bugs, must_verify_bugs
-            )
+            report.update_bug_list(operator.get_jira_issues(), dropped_bugs)
+            nm.share_dropped_bugs(dropped_bugs)
             if len(approved_doc_ads):
                 for ad in approved_doc_ads:
                     ad.refresh()

@@ -1,20 +1,21 @@
-import os
+import logging
 import re
 import smtplib
-import logging
-import oar.core.util as util
-from email.mime.text import MIMEText
+import os
 from email.mime.multipart import MIMEMultipart
-from oar.core.configstore import ConfigStore
-from oar.core.exceptions import NotificationException
-from oar.core.worksheet import TestReport
-from oar.core.jira import JiraManager
+from email.mime.text import MIMEText
+
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+import oar.core.util as util
+from oar.core.configstore import ConfigStore
+from oar.core.exceptions import NotificationException, JiraUnauthorizedException
+from oar.core.jira import JiraManager
+from oar.core.worksheet import TestReport
+from oar.core.ldap import LdapHelper
 
 logger = logging.getLogger(__name__)
-
 
 class NotificationManager:
     """
@@ -65,10 +66,10 @@ class NotificationManager:
         Send notification for take ownership result
 
         Args:
-            updated_ads ([]): updated advisory list
-            abnormal_ads ([]): advisory list that state is not QE
-            updated_subtasks ([]): updated jira subtasks
-            new_owner ([]): email address of the new owner
+            updated_ads (list): updated advisory list
+            abnormal_ads (list): advisory list that state is not QE
+            updated_subtasks (list): updated jira subtasks
+            new_owner (list): email address of the new owner
 
         Raises:
             NotificationException: error when share this info
@@ -98,7 +99,7 @@ class NotificationManager:
         Send slack message to all QA Contacts, ask them to verify ON_QA bugs
 
         Args:
-            jira_issues ([]): jira issue list
+            jira_issues (list): jira issue list
 
         Raises:
             NotificationException: error when share this info
@@ -115,12 +116,34 @@ class NotificationManager:
             raise NotificationException(
                 "share bugs to be verified failed") from e
 
+    def share_high_severity_bugs(self, jira_issues):
+        """
+        Send Slack message to all high severity issue QA Contacts, ask them to confirm dropping them from the release
+
+        Args:
+            jira_issues (list): high severity jira issue list
+
+        Raises:
+            NotificationException: error when share this info
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_high_severity_bugs(
+                jira_issues)
+            if len(slack_msg):
+                self.sc.post_message(
+                    self.cs.get_slack_channel_from_contact(
+                        "qe-forum"), slack_msg
+                )
+        except Exception as e:
+            raise NotificationException(
+                "share high severity bugs failed") from e
+
     def share_new_cve_tracker_bugs(self, cve_tracker_bugs):
         """
         Send slack message to ART team with new CVE tracker bugs
 
         Args:
-            cve_tracker_bugs ([]): list of new CVE tracker bug
+            cve_tracker_bugs (list): list of new CVE tracker bug
 
         Raises:
             NotificationException: error when checking new CVE tracker bugs
@@ -136,20 +159,65 @@ class NotificationManager:
             raise NotificationException(
                 "share missed CVE tracker bugs failed") from e
 
-    def share_dropped_and_must_verify_bugs(self, dropped_bugs, must_verify_bugs):
+    def share_unhealthy_advisories(self, unhealthy_advisories):
         """
-        Send slack message to QE release lead with dropped and must verified bugs
+        Send slack message to ART team with unhealthy advisories
 
         Args:
-            dropped_bugs ([]): list of dropped bugs
-            must_verified_bugs ([]): list of must verify bugs, could be [Critical/Blocker/Customer Case]
+            list: unhealthy_advisories
+
+        Raises:
+            NotificationException: error when sharing unhealthy advisories
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_unhealthy_advisories(
+                unhealthy_advisories)
+            if len(slack_msg):
+                self.sc.post_message(
+                    self.cs.get_slack_channel_from_contact("qe-release"), slack_msg
+                )
+        except Exception as e:
+            raise NotificationException(
+                "share unhealthy advisories failed") from e
+
+    def share_dropped_bugs(self, dropped_bugs):
+        """
+        Send Slack message for dropped bugs notification
+
+        Args:
+            dropped_bugs (list[str]): list of dropped bug IDs
+
+        Raises:
+            NotificationException: error when sending dropped bugs notification
+        """
+
+        try:
+            slack_msg = self.mh.get_slack_message_for_dropped_bugs(dropped_bugs)
+            if len(slack_msg):
+                self.sc.post_message(
+                    self.cs.get_slack_channel_from_contact(
+                        "qe-release"), slack_msg
+                )
+        except Exception as e:
+            raise NotificationException(
+                "share dropped bugs failed"
+            ) from e
+    
+    
+    def share_dropped_and_high_severity_bugs(self, dropped_bugs, high_severity_bugs):
+        """
+        Send Slack message to QE release lead with dropped and high severity bugs
+
+        Args:
+            dropped_bugs (list[str]): list of dropped bugs
+            high_severity_bugs (list[str]): list of high severity bugs, could be [Critical/Blocker/Customer Case/CVE]
 
         Raises:
             NotificationException: error when sending message
         """
         try:
-            slack_msg = self.mh.get_slack_message_for_dropped_and_must_verify_bugs(
-                dropped_bugs, must_verify_bugs
+            slack_msg = self.mh.get_slack_message_for_dropped_and_high_severity_bugs(
+                dropped_bugs, high_severity_bugs
             )
             if len(slack_msg):
                 self.sc.post_message(
@@ -158,7 +226,7 @@ class NotificationManager:
                 )
         except Exception as e:
             raise NotificationException(
-                "share dropped and must verified bugs failed"
+                "share dropped and high severity bugs failed"
             ) from e
 
     def share_doc_prodsec_approval_result(self, doc_appr, prodsec_appr):
@@ -192,6 +260,150 @@ class NotificationManager:
             raise NotificationException(
                 "share jenkins build url failed") from e
 
+    def share_greenwave_cvp_failures(self, jira_key):
+        """
+        Share greenwave cvp failures
+
+        Args:
+            jira_key(str): jira to be shared
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_failed_cvp(jira_key)
+            self.sc.post_message(self.cs.get_slack_channel_from_contact(
+                "qe-release"), slack_msg)
+        except Exception as e:
+            raise NotificationException(
+                "share greenwave cvp failures failed") from e
+
+    def share_shipment_mr(self, mr, new_owner):
+        """
+        Share shipment merge requests info via Slack
+
+        Args:
+            mr (str): Shipment merge request URL
+            new_owner (str): Email of new owner
+
+        Raises:
+            NotificationException: error when sharing shipment MR
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_shipment_mr(mr, new_owner)
+            self.sc.post_message(
+                self.cs.get_slack_channel_from_contact("qe-release"), slack_msg
+            )
+        except Exception as e:
+            raise NotificationException("share shipment MR failed") from e
+
+    def share_shipment_mr_and_ad_info(self, mr, updated_ads, abnormal_ads, updated_subtasks, new_owner):
+        """
+        Share shipment merge request and advisory info via Slack
+
+        Args:
+            mr (str): Shipment merge request URL
+            updated_ads (list): Updated advisory list
+            abnormal_ads (list): Advisory list that state is not QE
+            updated_subtasks (list): Updated jira subtasks
+            new_owner (str): Email of new owner
+
+        Raises:
+            NotificationException: error when sharing info
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_shipment_mr_and_ad_info(
+                mr, updated_ads, abnormal_ads, updated_subtasks, new_owner
+            )
+            self.sc.post_message(
+                self.cs.get_slack_channel_from_contact("qe-release"), slack_msg
+            )
+            if len(abnormal_ads):
+                slack_msg = self.mh.get_slack_message_for_abnormal_advisory(
+                    abnormal_ads
+                )
+                self.sc.post_message(
+                    self.cs.get_slack_channel_from_contact("art"), slack_msg
+                )
+        except Exception as e:
+            raise NotificationException("share shipment MR and AD info failed") from e
+        
+    def share_unverified_cve_issues_to_managers(self, unverified_cve_issues):
+        """
+        Share unverified CVE issues to managers of QA contacts
+
+        Args:
+            unverified_cve_issues (list[JiraIssue]): unverified cve jira issues list
+
+        Raises:
+            NotificationException: error when sharing unverified CVE issues failed
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_unverified_cve_issues_to_managers(
+                unverified_cve_issues)
+            if len(slack_msg):
+                self.sc.post_message(
+                    self.cs.get_slack_channel_from_contact(
+                        "qe-forum"), slack_msg
+                )
+        except Exception as e:
+            raise NotificationException(
+                "share unverified CVE issues to managers failed") from e
+
+    def share_release_approval_completion(self, release: str, success: bool, error: str = None, log_messages: list = None):
+        """
+        Share release approval completion notification
+        
+        Always sends notification to default QE release channel. If Slack context is available 
+        in environment variables, also sends full logs to specific thread.
+        
+        Args:
+            release (str): The release version (e.g., "4.19.0")
+            success (bool): Whether the approval was successful
+            error (str): Error message if any
+            log_messages (list): List of log messages to send (when Slack context available)
+            
+        Raises:
+            NotificationException: error when sending notification
+        """
+        try:
+            # Get Slack context from environment variables
+            slack_channel = os.environ.get('OAR_SLACK_CHANNEL')
+            slack_thread = os.environ.get('OAR_SLACK_THREAD')
+            
+            # Get release lead user group
+            y_release = util.get_y_release(release)
+            gid = self.sc.get_group_id_by_name(
+                self.cs.get_slack_user_group_from_contact("qe-release", y_release)
+            )
+            
+            # Create summary message for default channel
+            if success:
+                summary_message = f"Hello {gid}, Release approval completed for {release}. Payload metadata URL is now accessible and advisories have been moved to REL_PREP."
+            elif error:
+                summary_message = f"Hello {gid}, Release approval failed for {release}. Error: {error}"
+            else:
+                summary_message = f"Hello {gid}, Release approval timeout for {release}. Payload metadata URL still not accessible"
+            
+            # Always send to default channel
+            default_channel = self.cs.get_slack_channel_from_contact("qe-release")
+            self.sc.post_message(default_channel, summary_message)
+            logger.info(f"Sent completion notification to default channel {default_channel}")
+            
+            # If Slack context is available, also send full logs to specific thread
+            if slack_channel and slack_thread and log_messages:
+                # Send full log messages (which include the summary)
+                log_content = "\n".join(log_messages)
+                # Use utility function to split large messages
+                message_chunks = util.split_large_message(log_content)
+                for chunk in message_chunks:
+                    self.sc.client.chat_postMessage(
+                        channel=slack_channel,
+                        thread_ts=slack_thread,
+                        text=f"```{chunk}```"
+                    )
+                
+                logger.info(f"Also sent full logs to thread {slack_thread} in channel {slack_channel}")
+                
+        except Exception as e:
+            raise NotificationException("share release approval completion failed") from e
 
 class MailClient:
     """
@@ -242,6 +454,7 @@ class SlackClient:
         if not bot_token:
             raise NotificationException("slack bot token is not available")
         self.client = WebClient(token=bot_token)
+        self.cache_dict = dict()
 
     def post_message(self, channel, msg):
         """
@@ -265,14 +478,21 @@ class SlackClient:
             str: slack user id
         """
         email = self.transform_email(email)
-        try:
-            resp = self.client.api_call(
-                api_method="users.lookupByEmail", params={"email": email}
-            )
-            userid = resp["user"]["id"]
-        except SlackApiError as e:
-            logger.warning(f"cannot get slack user id for <{email}>: {e}")
-            return email
+        userid = None
+        if email in self.cache_dict:
+            userid = self.cache_dict.get(email)
+            logger.debug(f"Slack user id of {email} is retrieved from runtime cache")
+        else:
+            try:
+                resp = self.client.api_call(
+                    api_method="users.lookupByEmail", params={"email": email}
+                )
+                userid = resp["user"]["id"]
+                self.cache_dict[email] = userid
+                logger.debug(f"Slack user id of {email} is added to runtime cache")
+            except SlackApiError as e:
+                logger.warning(f"cannot get slack user id for <{email}>: {e}")
+                return email
 
         return "<@%s>" % userid
 
@@ -287,18 +507,24 @@ class SlackClient:
             group id: slack group id
         """
         ret_id = ""
-        try:
-            resp = self.client.api_call("usergroups.list")
-            if resp.data:
-                for group in resp.data["usergroups"]:
-                    gname = group["handle"]
-                    gid = group["id"]
-                    if gname == name:
-                        ret_id = gid
-                        break
-        except SlackApiError as e:
-            raise NotificationException(
-                f"query group id by name {name} error") from e
+        if name in self.cache_dict:
+            ret_id = self.cache_dict.get(name)
+            logger.debug(f"Slack group id of {name} is retrieved from runtime cache")
+        else:
+            try:
+                resp = self.client.api_call("usergroups.list")
+                if resp.data:
+                    for group in resp.data["usergroups"]:
+                        gname = group["handle"]
+                        gid = group["id"]
+                        if gname == name:
+                            ret_id = gid
+                            self.cache_dict[name] = ret_id
+                            logger.debug(f"Slack group id of {name} is added to runtime cache")
+                            break
+            except SlackApiError as e:
+                raise NotificationException(
+                    f"query group id by name {name} error") from e
 
         if not ret_id:
             raise NotificationException(
@@ -308,7 +534,7 @@ class SlackClient:
 
     def transform_email(self, email):
         '''
-        Email id in JIRA profile is not same as slack profile, 
+        Email id in JIRA profile is not same as slack profile,
         e.g. in JIRA it's xxx+jira, in slack it's xxx
         '''
         at_index = email.find('@')
@@ -329,6 +555,7 @@ class MessageHelper:
         self.cs = cs
         self.sc = SlackClient(self.cs.get_slack_bot_token())
         self.jm = JiraManager(cs)
+        self.ldap = LdapHelper()
 
     def get_mail_content_for_new_report(self, report: TestReport):
         """
@@ -374,10 +601,10 @@ class MessageHelper:
         manipulate slack message for ownership change
 
         Args:
-            updated_ads ([]): updated advisory list
-            abnormal_ads ([]): advisory list that state is not QE
-            updated_subtasks ([]): updated jira subtasks
-            new_owner ([]): email address of the new owner
+            updated_ads (list): updated advisory list
+            abnormal_ads (list): advisory list that state is not QE
+            updated_subtasks (list): updated jira subtasks
+            new_owner (list): email address of the new owner
         """
         gid = self.sc.get_group_id_by_name(
             self.cs.get_slack_user_group_from_contact(
@@ -407,32 +634,100 @@ class MessageHelper:
         manipulate slack message for bug verification
 
         Args:
-            jira_issues ([]): jira issue list
+            jira_issues (list): jira issue list
 
         Returns:
-            str: slack message
+            str: Slack message
+        """
+        message = "Please pay attention to following ON_QA bugs, let's verify them ASAP, thanks for your cooperation"
+        return self.__get_slack_message_for_jira_issues(jira_issues, message)
+    
+    def get_slack_message_for_unverified_cve_issues_to_managers(self, unverified_cve_issues):
+        """
+        Get Slack message for unverified CVE issues to managers of QA contacts
+
+        Args:
+            unverified_cve_issues (list[JiraIssue]): unverified cve jira issues list
+
+        Returns:
+            str: Slack message for unverified CVE issues to managers of QA contacts
+        """
+
+        message = "The following issues must be verified in this release. As the managers of the assigned QA contacts who have not yet verified these Jiras, could you please prioritize their verification or reassign them to other available QA contacts?"
+        
+        if len(unverified_cve_issues):
+            slack_message = f"[{self.cs.release}] {message}\n"
+            for issue in unverified_cve_issues:
+                qa_contact_email = issue.get_qa_contact()
+                manager_email = self.ldap.get_manager_email(qa_contact_email)
+                key = issue.get_key()
+                if manager_email:
+                    user_id = self.sc.get_user_id_by_email(manager_email)
+                else:
+                    logger.warning(f"Manager email was not found for user {qa_contact_email}")
+                    user_id = ""
+                slack_message += (self._to_link(util.get_jira_link(key), key)
+                                        + " "
+                                        + user_id
+                                        + "\n"
+                                )
+            return slack_message
+        else:
+            return ""
+
+    def get_slack_message_for_high_severity_bugs(self, jira_issues):
+        """
+        Get Slack message for high severity bug verification
+
+        Args:
+            jira_issues (list): high severity jira issue list
+
+        Returns:
+            str: Slack message
+        """
+        message = "The following bugs should be verified in this release. Please confirm whether they can be dropped or if you will verify them soon. Note that CVE issues still require verification. Thank you for your cooperation"
+        return self.__get_slack_message_for_jira_issues(jira_issues, message)
+
+    def __get_slack_message_for_jira_issues(self, jira_issues, message):
+        """
+        Get Slack message for given jira issues and message
+
+        Args:
+            jira_issues (list): jira issue list
+            message (str): message to be included alongside the jira list
+
+        Returns:
+            str: Slack message
         """
         has_onqa_issue = False
-        message = f"[{self.cs.release}] Please pay attention to following ON_QA bugs, let's verify them ASAP, thanks for the cooperation\n"
+        slack_message = f"[{self.cs.release}] {message}\n"
         for key in jira_issues:
-            issue = self.jm.get_issue(key)
+            try:
+                issue = self.jm.get_issue(key)
+            except JiraUnauthorizedException:
+                logger.error(f"jira token does not have permission to access security bugs {key}, ignore and continue")
+                continue
+
             if issue.is_on_qa():
-                message += (
-                    self._to_link(util.get_jira_link(key), key)
-                    + " "
-                    + self.sc.get_user_id_by_email(issue.get_qa_contact())
-                    + "\n"
+                if issue.is_cve_tracker():
+                    cve_warning = " This is a CVE bug and must be verified."
+                else:
+                    cve_warning = ""
+                slack_message += (
+                        self._to_link(util.get_jira_link(key), key)
+                        + " "
+                        + self.sc.get_user_id_by_email(issue.get_qa_contact())
+                        + cve_warning + "\n"
                 )
                 has_onqa_issue = True
-
-        return message if has_onqa_issue else ""
+        return slack_message if has_onqa_issue else ""
 
     def get_slack_message_for_abnormal_advisory(self, abnormal_ads):
         """
         manipulate slack message for abnormal advisories, raise this issue with ART team
 
         Args:
-            abnormal_ads ([]): advisory list
+            abnormal_ads (list): advisory list
 
         Returns:
             str: slack message
@@ -453,7 +748,7 @@ class MessageHelper:
         manipulate slack message for new CVE tracker bugs
 
         Args:
-            cve_tracker_bugs ([]): list of new CVE tracker bugs
+            cve_tracker_bugs (list): list of new CVE tracker bugs
 
         Returns:
             str: slack message
@@ -469,15 +764,12 @@ class MessageHelper:
 
         return message
 
-    def get_slack_message_for_dropped_and_must_verify_bugs(
-        self, dropped_bugs, must_verify_bugs
-    ):
+    def get_slack_message_for_unhealthy_advisories(self, unhealthy_advisories):
         """
-        manipulate slack message for dropped bugs and must verify bugs
+        manipulate slack message for unhealthy advisories
 
         Args:
-            dropped_bugs ([]): list of dropped bugs
-            must_verify_bugs ([]): list of must verify bugs
+            list: unhealthy advisories
 
         Returns:
             str: slack message
@@ -488,16 +780,87 @@ class MessageHelper:
             )
         )
 
+        message = f"Hello {gid}, Found unhealthy advisories, please check if this is a known issue before ping artist in channel #forum-ocp-release, thanks\n"
+
+        for ua in unhealthy_advisories:
+            message += f"Advisory {util.get_advisory_link(ua['errata_id'])} has grade {ua['ad_grade']} with unhealthy builds:\n"
+            for ub in ua["unhealthy_builds"]:
+                message += f"{ub['nvr']} build for architecture {ub['arch']} has grade {ub['grade']}\n"
+
+        return message
+
+    
+    def get_slack_message_for_dropped_bugs(self, dropped_bugs):
+        """
+        Generate a Slack notification message for bugs that have been dropped from advisories and shipment data.
+
+        This method creates a formatted message that notifies the QE release lead and documentation team
+        about bugs that have been removed from the current release. The message includes Jira links to
+        each dropped bug for easy reference.
+
+        Args:
+            dropped_bugs (list[str]): List of Jira issue keys that have been dropped from the release
+
+        Returns:
+            str: Formatted Slack message with links to all dropped bugs, or empty string if no bugs were dropped
+
+        Note:
+            The message is only generated if there are dropped bugs to report. If the dropped_bugs list
+            is empty, an empty string is returned.
+        """
+
+        release_lead_gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact(
+                "qe-release", util.get_y_release(self.cs.release)
+            )
+        )
+
+        docs_team_gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact("approver", "doc_id")
+        )
+
         message = ""
         if len(dropped_bugs):
-            message = f"[{self.cs.release}] Hello {gid}, following bugs are dropped from advisories\n"
+            message = f"[{self.cs.release}] Hello {release_lead_gid} {docs_team_gid}, following bugs are dropped from advisories and shipment data\n"
+            for bug in dropped_bugs:
+                message += self._to_link(util.get_jira_link(bug), bug) + "\n"
+        
+        return message
+
+    
+    def get_slack_message_for_dropped_and_high_severity_bugs(
+        self, dropped_bugs, high_severity_bugs
+    ):
+        """
+        Get Slack message for dropped bugs and high severity bugs
+
+        Args:
+            dropped_bugs (list[str]): list of dropped bugs
+            high_severity_bugs (list[str]): list of high severity bugs
+
+        Returns:
+            str: Slack message
+        """
+        release_lead_gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact(
+                "qe-release", util.get_y_release(self.cs.release)
+            )
+        )
+
+        docs_team_gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact("approver", "doc_id")
+        )
+
+        message = ""
+        if len(dropped_bugs):
+            message = f"[{self.cs.release}] Hello {release_lead_gid} {docs_team_gid}, following bugs are dropped from advisories and shipment data\n"
             for bug in dropped_bugs:
                 message += self._to_link(util.get_jira_link(bug), bug) + "\n"
 
-        if len(must_verify_bugs):
+        if len(high_severity_bugs):
             message += "\n" if len(message) else ""
-            message += f"[{self.cs.release}] Hello {gid}, following bugs are Critical/CVE Tracker/Customer Case, must be verified, if any of them can be dropped, do it manually, thanks\n"
-            for bug in must_verify_bugs:
+            message += f"[{self.cs.release}] Hello {release_lead_gid}, following bugs are Critical/Blocker/Customer Case/CVE Tracker, if any of them can be dropped, do it manually. CVE can not be dropped. Thanks\n"
+            for bug in high_severity_bugs:
                 message += self._to_link(util.get_jira_link(bug), bug) + "\n"
 
         return message
@@ -507,8 +870,8 @@ class MessageHelper:
         manipulate slack message for docs and prodsec approval
 
         Args:
-            doc_appr ([]): list of no doc approved advisories
-            prodsec_appr ([]): list of no product security approved advisories
+            doc_appr (list): list of no doc approved advisories
+            prodsec_appr (list): list of no product security approved advisories
 
         Returns:
             str: slack message
@@ -555,6 +918,92 @@ class MessageHelper:
             message += f"[{self.cs.release}] Hello {gid}, triggered jenkins build for job [{job_name}], url is {build_info}"
         else:
             message += f"[{self.cs.release}] Hello {gid}, {build_info}"
+
+        return message
+
+    def get_slack_message_for_failed_cvp(self, jira_key):
+        """
+        Get Slack message for failed Greenwave CVP tests
+
+        Args:
+         jira_key(str): jira to be added as part of the message
+
+        Returns: Slack message
+        """
+        gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact(
+                "qe-release", util.get_y_release(self.cs.release)
+            )
+        )
+        message = f"[{self.cs.release}] Hello {gid}, there are Greenwave CVP failures in advisories. Please contact CVP team. Use the following jira for reference: {util.get_jira_link(jira_key)}."
+
+        return message
+
+    def get_slack_message_for_shipment_mr(self, mr, new_owner):
+        """
+        Get Slack message for shipment merge request
+
+        Args:
+            mr (str): Shipment merge request URL
+            new_owner (str): Email of new owner
+
+        Returns:
+            str: Slack message
+        """
+        gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact(
+                "qe-release", util.get_y_release(self.cs.release)
+            )
+        )
+
+        message = f"[{self.cs.release}] Hello {gid}, QE release lead has been transferred to {new_owner}\n"
+        message += "Shipment merge requests:\n"
+        message += self._to_link(mr, mr) + "\n"
+
+        return message
+
+    def get_slack_message_for_shipment_mr_and_ad_info(
+        self, mr, updated_ads, abnormal_ads, updated_subtasks, new_owner
+    ):
+        """
+        Get Slack message combining shipment merge requests and advisory info
+
+        Args:
+            mr (str): Shipment merge request URL
+            updated_ads (list): Updated advisory list
+            abnormal_ads (list): Advisory list that state is not QE
+            updated_subtasks (list): Updated jira subtasks
+            new_owner (str): Email of new owner
+
+        Returns:
+            str: Slack message
+        """
+        gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact(
+                "qe-release", util.get_y_release(self.cs.release)
+            )
+        )
+
+        message = f"[{self.cs.release}] Hello {gid}, owner of advisories and jira subtasks are changed to {new_owner}\n"
+        
+        if mr:
+            message += f"Shipment merge request: {self._to_link(mr, mr)}\n"
+
+        message += "Updated advisories:\n"
+        for ad in updated_ads:
+            message += self._to_link(util.get_advisory_link(ad), ad) + " "
+        message += "\n"
+        
+        if updated_subtasks:
+            message += "Updated jira subtasks:\n"
+            for key in updated_subtasks:
+                message += self._to_link(util.get_jira_link(key), key) + " "
+
+        if len(abnormal_ads):
+            message += "\n"
+            message += "Found some abnormal advisories that state is not QE\n"
+            for ad in abnormal_ads:
+                message += self._to_link(util.get_advisory_link(ad), ad) + " "
 
         return message
 

@@ -1,13 +1,17 @@
-from errata_tool import Erratum
-from errata_tool import ErrataException
-from oar.core.configstore import ConfigStore
-from oar.core.exceptions import AdvisoryException
-from oar.core.jira import JiraManager, JiraException
-from oar.core.const import *
-import oar.core.util as util
-import logging
-import subprocess
 import json
+import logging
+import re
+import subprocess
+import koji
+import urllib3
+import oar.core.util as util
+from oar.core.configstore import ConfigStore
+from oar.core.const import *
+from oar.core.exceptions import AdvisoryException
+from oar.core.jira import JiraManager
+from datetime import datetime, timezone
+from dateutil import parser
+from errata_tool import Erratum, ErrataException, security
 
 logger = logging.getLogger(__name__)
 
@@ -26,19 +30,15 @@ class AdvisoryManager:
         Get all advisories
 
         Returns:
-            []Advisory: all advisory wrappers
+            list[Advisory]: all advisory wrappers
         """
         ads = []
         for k, v in self._cs.get_advisories().items():
-            if k == AD_IMPETUS_MICROSHIFT:
-                continue
-            ad = Advisory(
-                errata_id=v,
-                impetus=k,
-            )
-            if ad.errata_state != AD_STATUS_DROPPED_NO_SHIP:
-                ads.append(ad)
-
+            # in errata flow, handle all advisories except MICROSHIFT and DROPPED_NO_SHIP
+            if k != AD_IMPETUS_MICROSHIFT:
+                ad = Advisory(errata_id=v, impetus=k)
+                if ad.errata_state != AD_STATUS_DROPPED_NO_SHIP:
+                    ads.append(ad)
         return ads
 
     def get_jira_issues(self):
@@ -46,7 +46,7 @@ class AdvisoryManager:
         Get all jira issues from advisories in a release
 
         Returns:
-            []: all jira issues from advisories
+           list: all jira issues from advisories
         """
         all_jira_issues = []
         try:
@@ -66,8 +66,8 @@ class AdvisoryManager:
             AdvisoryException: error when communicate with errata tool
 
         Returns:
-            updated_ads ([]): updated advisory id list
-            abnormal_ads ([]): advisory id list of the ones state are not QE
+            updated_ads (list): updated advisory id list
+            abnormal_ads (list): advisory id list of the ones state are not QE
         """
         updated_ads = []
         abnormal_ads = []
@@ -96,7 +96,7 @@ class AdvisoryManager:
             AdvisoryException: error found when checking CVP test result
 
         Returns:
-            []test: abnormal test list
+            test (list): abnormal test list
         """
         abnormal_tests = []
         valid_status = [CVP_TEST_STATUS_PASSED, CVP_TEST_STATUS_WAIVED]
@@ -164,13 +164,10 @@ class AdvisoryManager:
         Change advisories status, e.g. REL_PREP
 
         Args:
-            status (str, optional): status used to update. Defaults to REL_PREP.
+            target_status (str, optional): status used to update. Defaults to REL_PREP.
 
         Raises:
             AdvisoryException: error when update advisory status
-
-        Returns:
-            _type_: _description_
         """
         try:
             ads = self.get_advisories()
@@ -188,56 +185,41 @@ class AdvisoryManager:
 
     def drop_bugs(self):
         """
-        Go thru all attached bugs. Drop the not verified bugs if they're not critical/blocker/customer_case
+        Drop unverified bugs from all advisories that are not cve tracker bugs.
+
+        This method iterates through all advisories and identifies bugs in ON_QA status that
+        have not been verified. These bugs are removed from the advisories unless they are
+        CVE tracker bugs, which must be verified and cannot be dropped
 
         Raises:
             AdvisoryException: error when dropping bugs from advisory
 
         Returns:
-            []: bugs cannot be dropped
+            list[str]: list of jira keys that were successfully dropped from advisories
         """
         jm = JiraManager(self._cs)
         ads = self.get_advisories()
         all_dropped_bugs = []
-        all_must_verify_bugs = []
         for ad in ads:
-            bug_list = []
-            issues = ad.jira_issues
-            if len(issues):
-                for key in issues:
+            drop_bug_list = jm.get_unverified_issues_excluding_cve(ad.jira_issues)
+            if drop_bug_list:
+                all_dropped_bugs.extend(drop_bug_list)
+                for key in drop_bug_list:
                     issue = jm.get_issue(key)
-                    if issue.is_verified() or issue.is_closed():
-                        continue
-                    else:
-                        # check whether the issue must be verified
-                        if (
-                            issue.is_critical_issue()
-                            or issue.is_customer_case()
-                            or issue.is_cve_tracker()
-                        ):
-                            logger.warning(
-                                f"jira issue {key} is critical: {issue.is_critical_issue()} or customer case: {issue.is_customer_case()} or cve tracker: {issue.is_cve_tracker()}, it must be verified"
-                            )
-                            all_must_verify_bugs.append(key)
-                        else:
-                            # issue can be dropped
-                            logger.info(
-                                f"jira issue {key} is {issue.get_status()} will be dropped from advisory {ad.errata_id}"
-                            )
-                            bug_list.append(key)
+                # issue can be dropped
+                logger.info(
+                    f"jira issue {key} is {issue.get_status()}, it will be dropped from advisory {ad.errata_id}"
+                )
+                ad.remove_bugs(drop_bug_list)
+                logger.info(
+                    f"not verified and non cve track bugs are dropped from advisory {ad.errata_id}"
+                )
+            else:
+                logger.info(
+                    f"there is no bug in advisory {ad.errata_id} that can be dropped"
+                )
 
-                if len(bug_list):
-                    all_dropped_bugs += bug_list
-                    ad.remove_bugs(bug_list)
-                    logger.info(
-                        f"not verified and non-critical bugs are dropped from advisory {ad.errata_id}"
-                    )
-                else:
-                    logger.info(
-                        f"there is no bug in advisory {ad.errata_id} can be dropped"
-                    )
-
-        return all_dropped_bugs, all_must_verify_bugs
+        return all_dropped_bugs
 
     def check_cve_tracker_bug(self):
         """
@@ -247,7 +229,7 @@ class AdvisoryManager:
             AdvisoryException: error when invoke elliott cmd
 
         Returns:
-            json: missed CVE tracker bugs
+            list: CVE tracker bugs not found in RHSA advisories
         """
         cmd = [
             "elliott",
@@ -256,18 +238,19 @@ class AdvisoryManager:
             "--group",
             f"openshift-{util.get_y_release(self._cs.release)}",
             "--assembly",
-            self._cs.release,
-            "find-bugs:sweep",
+            util.get_release_key(self._cs.release),
+            "--build-system",
+            "brew",
+            "find-bugs",
             "--cve-only",
-            "--report",
             "--output",
             "json",
+            "--permissive"
         ]
 
         logger.debug(f"elliott cmd {cmd}")
 
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         if p.returncode != 0:
             raise AdvisoryException(f"elliott cmd error:\n {stderr}")
@@ -275,20 +258,27 @@ class AdvisoryManager:
         cve_tracker_bugs = []
         result = stdout.decode("utf-8")
         if result:
-            logger.info("found new CVE tracker bug")
             logger.debug(result)
             json_obj = json.loads(result)
-            for tracker in json_obj:
-                id = tracker["id"]
-                summary = tracker["summary"]
-                logger.info(f"{id}: {summary}")
-                cve_tracker_bugs.append(id)
+            # OCPERT-66 double check if the bug is already attached on advisory
+            # get all jira issues from RHSA advisories
+            rhsa_ads = [ad for ad in self.get_advisories() if ad.is_rhsa()]
+            rhsa_jira_issues = []
+            for ad in rhsa_ads:
+                rhsa_jira_issues += ad.jira_issues
+            for trackers in json_obj.values():
+                if isinstance(trackers, list):
+                    for tracker in trackers:
+                        # add it to missed bug list if it is not attached on advisories
+                        if tracker not in rhsa_jira_issues:
+                            logger.info(f"CVE tracker bug {tracker} is not found in RHSA advisories")
+                            cve_tracker_bugs.append(tracker)
 
         return cve_tracker_bugs
 
     def get_doc_prodsec_approved_ads(self):
         """
-        get Docs and product security approved advisories
+        Get Docs and product security approved advisories
         """
         try:
             approved_doc_ads = []
@@ -305,6 +295,56 @@ class AdvisoryManager:
                 f"get request Docs and Prodsec approved advisories failed"
             ) from e
 
+    def check_advisories_grades_health(self):
+        """
+        Check advisories overall grade, advisories image builds grades and return unhealthy advisories.
+
+        Returns:
+            list: Unhealthy advisories {errata_id, ad_grade, unhealthy_builds}.
+        """
+        unhealthy_advisories = []
+
+        for ad in self.get_advisories():
+            if ad.impetus == AD_IMPETUS_RPM:
+                logger.info(
+                    f"skipping RPM advisory - {ad.errata_id}, it has no container")
+                continue
+
+            ad_grade = ad.get_overall_grade()
+
+            if not util.is_grade_healthy(ad_grade):
+                logger.error(
+                    f"advisory {ad.errata_id} is unhealthy, overall grade is {ad_grade}")
+                unhealthy_builds = ad.get_unhealthy_builds()
+                unhealthy_advisories.append(
+                    {"errata_id": ad.errata_id, "ad_grade": ad_grade, "unhealthy_builds": unhealthy_builds})
+
+                for ub in unhealthy_builds:
+                    logger.error(
+                        f"build {ub['nvr']} for architecture {ub['arch']} with grade {ub['grade']} is unhealthy")
+            else:
+                logger.info(
+                    f"advisory {ad.errata_id} is healthy, overall grade is {ad_grade}")
+
+        return unhealthy_advisories
+    
+    def has_finished_all_advisories_jiras(self):
+        """
+        Check all advisories jiras are finished (Closed, Verified or Release Pending) or they are dropped from advisories.
+
+        Returns:
+            bool: True if all advisories jiras are finished, False otherwise
+        """
+        jm = JiraManager(self._cs)
+        has_finished_all_advisories_jiras = True
+
+        for ad in self.get_advisories():
+            for jira_key in ad.jira_issues:
+                if not jm.get_issue(jira_key).is_finished():
+                    logger.warning(f"Advisory {ad.errata_id} has unfinished jira {jira_key}")
+                    has_finished_all_advisories_jiras = False
+
+        return has_finished_all_advisories_jiras
 
 class Advisory(Erratum):
     """
@@ -316,6 +356,10 @@ class Advisory(Erratum):
             self.impetus = kwargs["impetus"]
         self.push_job_status = {}
         self.no_push_job = False
+        # temp w/a to handle INC3282265 - errata.devel.redhat.com certificate has expired
+        # TODO: when errata cert is updated, rollback this change
+        security.security_settings._verify_ssl = False
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         try:
             super().__init__(**kwargs)
         except ErrataException as e:
@@ -357,12 +401,12 @@ class Advisory(Erratum):
         logger.info(
             f"advisory {self.errata_id} state is updated to {state.upper()}")
 
-    def remove_bugs(self, bug_list: list):
+    def remove_bugs(self, bug_list: list[str]):
         """
         Drop bugs from advisory
 
         Args:
-            bugs (str[]): bug list
+            bug_list (list[str]): bug list
         """
         self.removeJIRAIssues(bug_list)
         need_refresh = self.commit()
@@ -509,6 +553,7 @@ class Advisory(Erratum):
     def is_doc_approved(self):
         """
         Check if doc is approved for an advisory
+
         Returns:
             bool: True if doc for an advisory is approved, otherwise False
         """
@@ -517,6 +562,7 @@ class Advisory(Erratum):
     def is_prodsec_approved(self):
         """
         Check if prodsec is approved for an advisory
+
         Returns:
             bool: True if prodsec is approved, otherwise False
         """
@@ -525,6 +571,7 @@ class Advisory(Erratum):
     def is_doc_requested(self):
         """
         Check if doc for an advisory is requested
+
         Returns:
             bool: True if doc for an advisory is requested, otherwise False
         """
@@ -533,14 +580,15 @@ class Advisory(Erratum):
     def is_prodsec_requested(self):
         """
         Check if prodsec for an advisory is requested
+
         Returns:
-        bool: False if prodsec for an advisory is requested, otherwise False
+            bool: False if prodsec for an advisory is requested, otherwise False
         """
         return self.get_erratum_data()["security_approved"] == False
 
     def request_doc_approval(self):
         """
-        send doc approval request for an advisory
+        Send doc approval request for an advisory
         """
         pdata = {"advisory[text_ready]": 1}
         url = "/api/v1/erratum/%i" % self.errata_id
@@ -549,7 +597,7 @@ class Advisory(Erratum):
 
     def request_prodsec_approval(self):
         """
-        send product security approval request for an advisory
+        Send product security approval request for an advisory
         """
         pdata = {"advisory[security_approved]": False}
         url = "/api/v1/erratum/%i" % self.errata_id
@@ -629,3 +677,132 @@ class Advisory(Erratum):
             return blocking
         else:
             return False
+
+    def get_unhealthy_builds(self):
+        """
+        Get unhealthy builds of advisory.
+
+        Returns:
+            list: Unhealthy builds.
+        """
+        unhealthy_builds = []
+
+        for product_version in self.errata_builds:
+            for nvr in self.errata_builds[product_version]:
+                build_grades = self.get_build_grades(nvr)
+                for bg in build_grades:
+                    if not util.is_grade_healthy(bg["grade"]):
+                        unhealthy_builds.append(bg)
+
+        return unhealthy_builds
+
+    def get_build_grades(self, nvr):
+        """
+        Get all architecture grades of build.
+
+        Returns:
+            list: All architecture grades of build {nvr, architecture, grade}.
+        """
+        nvr_url = "https://pyxis.engineering.redhat.com/v1/images/nvr/%s?include=data.freshness_grades&include=data.architecture" % nvr
+        resp = self._get(nvr_url, raw=True)
+        nvr_grades = []
+
+        if resp.ok:
+            for arch in resp.json()["data"]:
+                effective_grade = None
+                for fg in arch["freshness_grades"]:
+                    checked_grade = fg["grade"]
+                    start_date = parser.parse(fg["start_date"])
+
+                    # skip if checked grade is not effective yet
+                    if start_date > datetime.now(timezone.utc):
+                        continue
+
+                    # skip if checked grade is no longer effective
+                    if "end_date" in fg and parser.parse(fg["end_date"]) < datetime.now(timezone.utc):
+                        continue
+
+                    # skip if checked grade is smaller than current effective grade (if intervals are overlapping, bigger grade is taken)
+                    if effective_grade and checked_grade < effective_grade:
+                        continue
+
+                    # save new effective grade
+                    effective_grade = checked_grade
+
+                nvr_grades.append(
+                    {"nvr": nvr, "arch": arch["architecture"], "grade": effective_grade})
+        else:
+            raise AdvisoryException(f"error when accessing build nvr - {nvr}")
+        return nvr_grades
+
+    def get_overall_grade(self):
+        """
+        Get overall grade of advisory.
+
+        Retruns:
+            str: Overall grade of advisory.
+        """
+        container_url = f"{util.get_advisory_domain_url()}/errata/container/{self.errata_id}"
+        resp = self._get(container_url, raw=True)
+
+        if resp.ok:
+            search_result = re.search(
+                "Docker Container Content - ([A-F])", resp.text)
+            if search_result:
+                return search_result.group(1)
+            else:
+                raise AdvisoryException(
+                    f"cannot find overall advisory grade - {self.errata_id}")
+        else:
+            raise AdvisoryException(
+                f"error when accessing advisory containers - {self.errata_id}")
+
+    def check_kernel_tag(self):
+        """
+        Check kernel tag from advisory build image.
+
+        Returns:
+            bool: True if kernel build is tagged with early-kernel-stop-ship.
+        """
+        #Check if impetus is image/rhcos or not, if it's not then skip this function.
+        if self.impetus not in [AD_IMPETUS_IMAGE, AD_IMPETUS_RHCOS]:
+            logger.info(f"{self.impetus} advisory does not have RHCOS build, skip checking kernel tag")
+            return False
+        #Get rhcos nvr from image advisory build
+        build_response = self._get(f"/api/v1/erratum/{self.errata_id}/builds")
+        rhcos_nvr = None
+        for value in build_response.values():
+            for build in value['builds']:
+                for build_name in build.keys():
+                    if build_name.startswith("rhcos-x86"):
+                        rhcos_nvr = build_name
+                        break
+        logger.info(f"RHCOS nvr is {rhcos_nvr}")
+        # if there is no rhcos build found, skip checking
+        if rhcos_nvr is None:
+            logger.warning("No RHCOS nvr found, skip kernel tag checking")
+            return False
+        #Download the commit metadata based on info in nvr.
+        rhcos_nvr_url = re.sub(r"-([\d.]+)-(\d+)$", r"/\1/\2", rhcos_nvr)
+        rhcos_nvr_url_full = "https://download.eng.bos.redhat.com/brewroot/packages/"+rhcos_nvr_url+"/metadata.json"
+        rhos_meta_data_full = self._get(rhcos_nvr_url_full)
+        kernel_build = [
+            f"{comp['name']}-{comp['version']}-{comp['release']}"
+            for entry in rhos_meta_data_full['output']
+            if entry['components']
+            for comp in entry['components']
+            if comp['name'] == 'kernel'
+        ][0]
+        logger.info(f"The commit metadata is {kernel_build}")
+        #Use koji api to query tags of this build
+        session = koji.ClientSession("https://brewhub.engineering.redhat.com/brewhub")
+        tags = session.listTags(build=kernel_build)
+        logger.info(f"Tags of this build is {tags}")
+        for t in tags:
+            if t["name"] == 'early-kernel-stop-ship':
+                logger.info("kernel tag early-kernel-stop-ship is detected")
+                return True
+        return False
+
+    def is_rhsa(self):
+        return self.errata_type == 'RHSA'

@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 
-import requests
 import json
 import logging
 import os
 import re
-import click
-import subprocess
 import shlex
-import yaml
-from .job import Jobs
-from .artifacts import Artifacts
-from github import Auth, Github
-from github.GithubException import UnknownObjectException
-from requests.exceptions import RequestException
+import subprocess
 from subprocess import CalledProcessError
+
+import click
+import requests
+import yaml
+from github import Auth, Github
+from github.GithubException import UnknownObjectException, GithubException
 from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
 from urllib3 import Retry
 
+from .artifacts import Artifacts
+from .job import Jobs
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,23 @@ DIR_RELEASE = "_releases"
 SYS_ENV_VAR_GITHUB_TOKEN = "GITHUB_TOKEN"
 SYS_ENV_VAR_API_TOKEN = "APITOKEN"
 SYS_ENV_VAR_GCS_CRED_FILE = "GCS_CRED_FILE"
-VALID_RELEASES = ["4.11", "4.12", "4.13", "4.14", "4.15", "4.16", "4.17"]
-HTTP_CODE_FOR_RETRY = [429, 500, 502, 503, 504]
+REQUIRED_ENV_VARS_FOR_CONTROLLER = [
+    SYS_ENV_VAR_GITHUB_TOKEN, SYS_ENV_VAR_API_TOKEN]
+REQUIRED_ENV_VARS_FOR_AGGREGATOR = [
+    SYS_ENV_VAR_GITHUB_TOKEN, SYS_ENV_VAR_API_TOKEN, SYS_ENV_VAR_GCS_CRED_FILE]
+
+
+def create_session() -> requests.Session:
+    retry_strategy = Retry(total=5, backoff_factor=2,
+                           status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.stream = True
+
+    return session
 
 
 class Architectures():
@@ -64,6 +80,7 @@ class ReleaseStreamURLResolver():
         self._arch = Architectures.fromString(arch)
         self._nightly = nightly
         self._release = release
+        self._session = create_session()
 
     def get_url_for_latest(self):
         base_url = f"https://{self._arch}.ocp.releases.ci.openshift.org/api/v1/releasestream"
@@ -76,7 +93,7 @@ class ReleaseStreamURLResolver():
         else:
             url = f"{base_url}/{releasestream}/latest?prefix={self._release}"
             # if stable build is not available for latest release, use dev preview releasestream instead
-            if requests.get(url).status_code == 404:
+            if self._session.get(url).status_code == 404:
                 releasestream = "4-dev-preview" + suffix
                 url = f"{base_url}/{releasestream}/latest"
 
@@ -90,6 +107,12 @@ class ReleaseStreamURLResolver():
             build[:4], "nightly" in build, arch)
 
         return url_resolver.get_url_for_latest().replace("latest", f"release/{build}")
+
+    @staticmethod
+    def get_url_for_tags(build, arch):
+        url_resolver = ReleaseStreamURLResolver(
+            build[:4], "nightly" in build, arch)
+        return url_resolver.get_url_for_latest().replace("latest", "tags")
 
 
 class Build():
@@ -126,6 +149,9 @@ class Build():
 
     def __str__(self):
         return self.name
+
+    def __repr__(self):
+        return json.dumps(self._json_data, indent=2)
 
     def to_dict(self):
         return self._json_data
@@ -182,7 +208,6 @@ class JobController:
     def __init__(self, release, nightly=True, trigger_prow_job=True, arch=Architectures.AMD64):
         self._release = release[:-
                                 2] if len(release.split(".")) == 3 else release
-        validate_required_info(release)
         self._nightly = nightly
         self._trigger_prow_job = trigger_prow_job
         self._arch = Architectures.fromString(arch)
@@ -197,9 +222,7 @@ class JobController:
         self.release_test_record = GithubUtil(
             REPO_RELEASE_TESTS, BRANCH_RECORD)
         self.release_test_master = GithubUtil(REPO_RELEASE_TESTS)
-        self._session = requests.Session()
-        self._session.mount("https", HTTPAdapter(
-            max_retries=Retry(5, status_forcelist=HTTP_CODE_FOR_RETRY)))
+        self._session = create_session()
 
     def get_latest_build(self):
         try:
@@ -234,6 +257,22 @@ class JobController:
                 build.raw_data, self._build_file)
 
         logger.info(f"current build info is updated on repo")
+
+    def get_build(self, build):
+        build_obj = None
+        url = self.url_resolver.get_url_for_tags(build, self._arch)
+        resp = self._session.get(url)
+        if resp.ok:
+            json_data = resp.json()
+            for tag in json_data["tags"]:
+                if build == tag["name"]:
+                    build_obj = Build(tag)
+                    break
+        else:
+            logger.error(
+                f"Get build {build} failed: {resp.status_code} {resp.reason}")
+
+        return build_obj
 
     def trigger_prow_jobs(self, build: Build):
 
@@ -324,6 +363,8 @@ class GithubUtil:
         self._branch = branch
 
     def push_file(self, data, path):
+        if isinstance(data, dict):
+            data = json.dumps(data, indent=2)
         if self.file_exists(path):
             content = self._repo.get_contents(path=path, ref=self._branch)
             logger.info(f"Updating file {content.path}")
@@ -355,11 +396,12 @@ class GithubUtil:
         try:
             self._repo.get_contents(path=path, ref=self._branch)
             logger.info(f"File {path} can be found")
-        except UnknownObjectException:
+            return True
+        except (UnknownObjectException, GithubException) as e:
+            if isinstance(e, GithubException) and e.status != 404:
+                raise
             logger.info(f"File {path} not found")
             return False
-
-        return True
 
     def delete_file(self, path):
         if self.file_exists(path):
@@ -433,11 +475,9 @@ class TestJobRegistry():
 class ProwJobResult():
 
     def __init__(self, job_data):
-        self._result = None
+        self._result = job_data
         self.job_api = Jobs()
-        if "jobCompletionTime" in job_data:
-            self.from_dict(job_data)
-        else:
+        if "jobCompletionTime" not in job_data:
             self.fetch(job_data.get("jobID"))
         # if job is completed, get test report from artifacts
         self._get_test_result_summary()
@@ -484,6 +524,10 @@ class ProwJobResult():
     def from_dict(self, result):
         if result:
             self._result = result
+        else:
+            # raise exception if the result from Gangway is None
+            raise Exception("result from Gangway is empty")
+
         return self
 
     def fetch(self, job_id):
@@ -491,12 +535,11 @@ class ProwJobResult():
             self.from_dict(self.job_api.get_job_results(job_id))
         except Exception as e:
             logger.error(f"fetch job result error: {e}")
-            # if job info cannot be retrieved from gangway, init result as empty dict
-            self._result = {}
+
         return self
 
     def _get_test_result_summary(self):
-        if self.is_completed() and not self.test_result_summary:
+        if self.is_completed() and self.job_url and not self.test_result_summary:
             url_split = self.job_url.split("/")
             job_name = url_split[-2]
             job_run_id = url_split[-1]
@@ -661,15 +704,12 @@ class TestMetrics():
 class TestResultAggregator():
 
     def __init__(self, arch=Architectures.AMD64):
-        validate_required_info()
         self._arch = Architectures.fromString(arch)
         self.job_registry = TestJobRegistry(self._arch)
         self.release_test_record = GithubUtil(
             REPO_RELEASE_TESTS, BRANCH_RECORD)
         self.job_api = Jobs()
-        self._session = requests.Session()
-        self._session.mount("https", HTTPAdapter(
-            max_retries=Retry(5, status_forcelist=HTTP_CODE_FOR_RETRY)))
+        self._session = create_session()
 
     def start(self):
         logger.info("Start to scan test result files ...")
@@ -697,7 +737,7 @@ class TestResultAggregator():
                 json_data = json.loads(file_content)
                 logger.info(f"Start to check test result for {build} ...")
                 # if attribute `aggregated` found, i.e. the result is already analyzed, skip aggregation for this build
-                if self.is_test_result_aggregated(json_data):
+                if self.__is_test_result_aggregated(json_data):
                     continue
 
                 jobs = json_data["result"]
@@ -741,16 +781,15 @@ class TestResultAggregator():
 
                 logger.info(f"Test result summary of {build}: {metrics}")
 
-                if metrics.is_qe_accepted():
-                    # self.update_releasepayload(build)
-                    pass
+                if metrics.is_qe_accepted() or self.__is_test_result_promoted_manually(json_data):
+                    self.update_releasepayload(build)
 
                 # if all the jobs are completed, we add a attribute `aggregated` to indicate this test result is aggregated
                 if metrics.all_jobs_are_completed():
                     json_data["aggregated"] = True
                     json_data["accepted"] = metrics.is_qe_accepted()
                 self.release_test_record.push_file(
-                    data=json.dumps(json_data, indent=2), path=content.path)
+                    data=json_data, path=content.path)
                 logger.info(
                     f"Latest test result of {build} is updated to file {content.path}")
 
@@ -795,8 +834,7 @@ class TestResultAggregator():
 
             logger.info(f"Retried jobs: {retried_jobs}")
 
-    def is_test_result_aggregated(self, json_data):
-
+    def __is_test_result_aggregated(self, json_data):
         if json_data.get("aggregated") == True:
             build = Build(json_data.get("build"))
             logger.info(
@@ -805,19 +843,65 @@ class TestResultAggregator():
 
         return False
 
+    def __is_test_result_promoted_manually(self, json_data):
+        return "manual_promotion" in json_data
 
-def validate_required_info(release=None):
-    if os.environ.get(SYS_ENV_VAR_API_TOKEN) is None:
+    def __get_test_result(self, file_path):
+        json_data = None
+        if self.release_test_record.file_exists(file_path):
+            file_content = self.release_test_record.get_file_content(file_path)
+            json_data = json.loads(file_content)
+
+        return json_data
+
+    def __get_test_result_file_path(self, build):
+        return f"{DIR_RELEASE}/ocp-test-result-{build}-{self._arch}.json"
+
+    def promote_test_results_for_build(self, build):
+        file_path = self.__get_test_result_file_path(build)
+        json_data = self.__get_test_result(file_path)
+        if json_data:
+            # update attr aggregated to false, so this file will be processed in next aggregator job
+            json_data["aggregated"] = False
+            # update attr `manual_promotion`, so releasepayload will be updated
+            json_data["manual_promotion"] = True
+            # update the file content
+            self.release_test_record.push_file(data=json_data, path=file_path)
+
+    def update_retried_job_run(self, build, job_name, current_job_id, new_job_id):
+        file_path = self.__get_test_result_file_path(build)
+        json_data = self.__get_test_result(file_path)
+        if json_data:
+            # find job result by job name
+            results = json_data["result"]
+            job_result = None
+            for result in results:
+                if result["jobName"] == job_name:
+                    job_result = result
+                    break
+            if job_result:
+                # get retried job run and update jobID with new one
+                retried_job_runs = job_result["retriedJobs"]
+                for job_run in retried_job_runs:
+                    if job_run["jobID"] == current_job_id:
+                        job_run.clear()
+                        job_run["jobID"] = new_job_id
+                        break
+                # delete attr `aggregated` and `accepted`
+                json_data.pop("aggregated", None)
+                json_data.pop("accepted", None)
+                self.release_test_record.push_file(
+                    data=json_data, path=file_path)
+            else:
+                logger.error(f"cannot find job name {job_name} in {file_path}")
+
+
+def validate_required_info(required_env_vars):
+    missing_env_vars = [
+        var for var in required_env_vars if os.environ.get(var) is None]
+    if missing_env_vars:
         raise SystemExit(
-            f"Cannot find environment variable {SYS_ENV_VAR_API_TOKEN}")
-    if os.environ.get(SYS_ENV_VAR_GITHUB_TOKEN) is None:
-        raise SystemExit(
-            f"Cannot find environment variable {SYS_ENV_VAR_GITHUB_TOKEN}")
-    if os.environ.get(SYS_ENV_VAR_GCS_CRED_FILE) is None:
-        raise SystemExit(
-            f"Cannot find environment variable {SYS_ENV_VAR_GCS_CRED_FILE}")
-    if release and release not in VALID_RELEASES:
-        raise SystemExit(f"{release} is not supported")
+            f"Missing required environment variables: {', '.join(missing_env_vars)}")
 
 
 @click.group()
@@ -836,14 +920,56 @@ def cli(debug):
 @click.option("--trigger-prow-job", help="trigger prow job if new build is found", default=True)
 @click.option("--arch", help="architecture used to filter accepted build", default=Architectures.AMD64, type=click.Choice(Architectures.VALID_ARCHS))
 def start_controller(release, nightly, trigger_prow_job, arch):
+    validate_required_info(REQUIRED_ENV_VARS_FOR_CONTROLLER)
     JobController(release, nightly, trigger_prow_job, arch).start()
+
+
+@click.command
+@click.option("--build", help="build version e.g. 4.16.20", required=True)
+@click.option("--arch", help="architecture used to filter accepted build", default=Architectures.AMD64, type=click.Choice(Architectures.VALID_ARCHS))
+def trigger_jobs_for_build(build, arch):
+    validate_required_info(REQUIRED_ENV_VARS_FOR_CONTROLLER)
+    release = build[:4]
+    nightly = "nightly" in build
+    controller = JobController(release, nightly, True, arch)
+    build_obj = controller.get_build(build)
+    if build_obj is None:
+        raise click.BadParameter(
+            f"build {build} does not exist, please double check")
+    logger.info(
+        f"start to trigger prow jobs for build:\n{repr(build_obj)}")
+    controller.trigger_prow_jobs(build_obj)
 
 
 @click.command
 @click.option("--arch", help="architecture used to filter test result", default=Architectures.AMD64, type=click.Choice(Architectures.VALID_ARCHS))
 def start_aggregator(arch):
+    validate_required_info(REQUIRED_ENV_VARS_FOR_AGGREGATOR)
     TestResultAggregator(arch).start()
+
+
+@click.command
+@click.option("--arch", help="architecture used to filter test result", default=Architectures.AMD64, type=click.Choice(Architectures.VALID_ARCHS))
+@click.option("--build", help="build version e.g. 4.16.20", required=True)
+def promote_test_results(arch, build):
+    validate_required_info([SYS_ENV_VAR_GITHUB_TOKEN])
+    TestResultAggregator(arch).promote_test_results_for_build(build)
+
+
+@click.command
+@click.option("--arch", help="architecture used to filter test result", default=Architectures.AMD64, type=click.Choice(Architectures.VALID_ARCHS))
+@click.option("--build", help="build version e.g. 4.16.20", required=True)
+@click.option("--job-name", help="prow job name configured in test job registry", required=True)
+@click.option("--current-job-id", help="current job run id", required=True)
+@click.option("--new-job-id", help="new job run id used to replace current job id", required=True)
+def update_retried_job_run(arch, build, job_name, current_job_id, new_job_id):
+    validate_required_info([SYS_ENV_VAR_GITHUB_TOKEN])
+    TestResultAggregator(arch).update_retried_job_run(
+        build, job_name, current_job_id, new_job_id)
 
 
 cli.add_command(start_controller)
 cli.add_command(start_aggregator)
+cli.add_command(promote_test_results)
+cli.add_command(update_retried_job_run)
+cli.add_command(trigger_jobs_for_build)

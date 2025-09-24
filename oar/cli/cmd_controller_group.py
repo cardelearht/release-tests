@@ -1,10 +1,13 @@
-import click
 import logging
 import sys
+
+import click
+
 import oar.core.util as util
 from oar import version
 from oar.controller.detector import start_release_detector
 from oar.core.const import CONTEXT_SETTINGS
+from oar.notificator.jira_notificator import jira_notificator
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ def cli(debug):
 
 
 cli.add_command(start_release_detector)
+cli.add_command(jira_notificator)
 
 if __name__ == '__main__':
     cli()

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # coding:utf-8
-import requests
-import time
-import json
-from semver import VersionInfo
-import yaml
 import base64
-import os
-import sys
-import re
 import csv
-import click
-import logging
-import yaml
 import http.client as httpclient
+import json
+import logging
+import os
+import re
+import sys
+import time
+
+import click
+import requests
+import yaml
 from requests.adapters import HTTPAdapter
+from semver import VersionInfo
 from urllib3.util import Retry
 
 
@@ -412,7 +412,7 @@ class Jobs:
     def get_job_results(self, job_id, job_name=None, payload=None, upgrade_from=None, upgrade_to=None):
         """Function get job results"""
         if job_id:
-            resp = requests.get(url=self.prow_job_url.format(job_id.strip()))
+            resp = self._get_session().get(url=self.prow_job_url.format(job_id.strip()))
             if resp.status_code == 200 and resp.text:
                 job_result = yaml.safe_load(resp.text)
                 if job_result:

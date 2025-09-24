@@ -1,21 +1,18 @@
-import click
 import logging
-import re
-import oar.core.util as util
-from oar.core.worksheet import WorksheetManager, WorksheetException
-from oar.core.jira import JiraManager, JiraException
-from oar.core.advisory import AdvisoryManager, AdvisoryException
-from oar.core.configstore import ConfigStore
-from oar.core.notification import NotificationManager, NotificationException
+
+import click
+
 from oar.core.const import *
+from oar.core.jira import JiraManager
+from oar.core.operators import NotificationOperator, ReleaseOwnershipOperator
+from oar.core.util import is_valid_email
+from oar.core.worksheet import WorksheetManager
 
 logger = logging.getLogger(__name__)
 
-
-def validate_email(ctx, param, value):
-    email_pattern = re.compile(
-        r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
-    if not email_pattern.match(value):
+def validate_email_for_cli(ctx, param, value):
+    """Validate email address using util.validate_email and raise click exception if invalid"""
+    if not is_valid_email(value):
         raise click.BadParameter(f"{value} is not a valid email")
     return value
 
@@ -25,7 +22,7 @@ def validate_email(ctx, param, value):
     "-e",
     "--email",
     required=True,
-    callback=validate_email,
+    callback=validate_email_for_cli,
     help="email address of the owner",
 )
 @click.pass_context
@@ -43,13 +40,18 @@ def take_ownership(ctx, email):
         report = wm.get_test_report()
         # update task status to in progress
         report.update_task_status(LABEL_TASK_OWNERSHIP, TASK_STATUS_INPROGRESS)
-        # update assignee of QE subtasks and change status of test verification ticket to in_progress
+        # update ownership across advisories and shipments
+        ro = ReleaseOwnershipOperator(cs)
+        updated_ads, abnormal_ads = ro.update_owners(email)
+        # update assignee of QE subtasks
         updated_subtasks = JiraManager(cs).change_assignee_of_qe_subtasks()
-        # update owner of advisories which status is QE
-        updated_ads, abnormal_ads = AdvisoryManager(cs).change_ad_owners()
-        # send notification
-        NotificationManager(cs).share_ownership_change_result(
-            updated_ads, abnormal_ads, updated_subtasks, cs.get_owner()
+        # send notification about ownership change and shipment MRs
+        no = NotificationOperator(cs)
+        no.share_ownership_change(
+            updated_ads,
+            abnormal_ads,
+            updated_subtasks,
+            email
         )
         # update task status to pass
         report.update_task_status(LABEL_TASK_OWNERSHIP, TASK_STATUS_PASS)

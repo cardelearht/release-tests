@@ -1,12 +1,14 @@
-import re
-import time
-import jenkins
 import logging
-import oar.core.util as util
+import time
+
+import jenkins
 from jenkins import JenkinsException
-from oar.core.exceptions import JenkinsHelperException
+
+import oar.core.util as util
 from oar.core.configstore import ConfigStore
 from oar.core.const import *
+from oar.core.exceptions import JenkinsException
+from oar.core.shipment import ShipmentData
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,10 @@ class JenkinsHelper:
         self.errata_numbers = " ".join(
             [str(i) for i in [val for val in self._cs.get_advisories().values()]]
         )
+        # get shipment MR id
+        mr = ShipmentData(cs).get_mr()
+        self.mr_id = mr.get_id() if mr else None
+        # construct image pull spec
         self.pull_spec = (
             "quay.io/openshift-release-dev/ocp-release:" + self._cs.release + "-x86_64"
         )
@@ -28,13 +34,14 @@ class JenkinsHelper:
 
     def call_stage_job(self):
         try:
-            if not self.metadata_ad:
+            # only check metadata ad for errata flow
+            if not self._cs.is_konflux_flow() and not self.metadata_ad:
                 raise JenkinsException("metadata advisory not found")
 
             build_url = self.call_build_job(
                 JENKINS_JOB_STAGE_PIPELINE, self.pull_spec)
         except JenkinsException as ej:
-            raise JenkinsHelperException(
+            raise JenkinsException(
                 "call stage pipeline job failed") from ej
         return build_url
 
@@ -44,7 +51,7 @@ class JenkinsHelper:
             build_url = self.call_build_job(
                 "image-consistency-check", pull_spec)
         except JenkinsException as ej:
-            raise JenkinsHelperException(
+            raise JenkinsException(
                 "call image-consistency-check pipeline job failed"
             ) from ej
         return build_url
@@ -71,7 +78,7 @@ class JenkinsHelper:
                     break
 
             if not params_action:
-                raise JenkinsHelperException(
+                raise JenkinsException(
                     f"cannot find parameter action for build {job_name}/{build_number}")
 
             # find param value of payload url
@@ -82,7 +89,7 @@ class JenkinsHelper:
                     break
 
             if not payload_url:
-                raise JenkinsHelperException(
+                raise JenkinsException(
                     f"cannot find payload url value in parameters of {job_name}/{build_number}")
 
             stable_version = self._cs.release
@@ -91,7 +98,7 @@ class JenkinsHelper:
             # both stable and candidate build cannot be found in payload url, i.e. this job is not triggered for current z-stream release
             # raise the exception
             if not stable_version in payload_url and not candidate_version in payload_url:
-                raise JenkinsHelperException(
+                raise JenkinsException(
                     f"please make sure this build {job_name}/{build_number} is triggered for {stable_version}, cannot find {stable_version} or {candidate_version} in payload url {payload_url}")
 
             # start to check build status and return
@@ -105,7 +112,7 @@ class JenkinsHelper:
                 f"build status of {job_name}/{build_number} is {job_status}")
 
         except Exception as e:
-            raise JenkinsHelperException(
+            raise JenkinsException(
                 f"get job {job_name}/{build_number} status failed"
             ) from e
 
@@ -121,7 +128,7 @@ class JenkinsHelper:
                 if 'name' in item['task'] and item['task']['name'] == job_name:
                     return True
         except Exception as e:
-            raise JenkinsHelperException(
+            raise JenkinsException(
                 f"check job queue failed"
             ) from e
 
@@ -137,15 +144,22 @@ class JenkinsHelper:
             if (job_name == JENKINS_JOB_IMAGE_CONSISTENCY_CHECK):
                 parameters_value = {
                     "VERSION": "v" + self.version,
-                    "ERRATA_NUMBERS": self.errata_numbers,
                     "PAYLOAD_URL": pull_spec,
                 }
+                # Add SHIPMENT_MR_ID if shipment MR is available
+                if self.mr_id:
+                    parameters_value["SHIPMENT_MR_ID"] = self.mr_id
+                else:
+                    parameters_value["ERRATA_NUMBERS"] = self.errata_numbers
             elif (job_name == JENKINS_JOB_STAGE_PIPELINE):
                 parameters_value = {
                     "VERSION": self.version,
-                    "METADATA_AD": self.metadata_ad,
                     "PULL_SPEC": pull_spec,
                 }
+                # only add metadata ad to job request for errata release flow
+                # if param metadata_ad is not provided, stage 'Verify Metadata' will be skipped.
+                if self.metadata_ad:
+                    parameters_value["METADATA_AD"] = self.metadata_ad
             else:
                 logger.info(f"{job_name} is not supported")
 
@@ -170,14 +184,14 @@ class JenkinsHelper:
                         else:
                             time.sleep(interval)
                 except:
-                    raise JenkinsHelperException(
+                    raise JenkinsException(
                         f"visit {queue_item_link} failed")
 
                 if not build_info:
                     build_info = f"polling queue item {queue_item_link} timeout, please check build url in this item manually"
 
         except JenkinsException as ej:
-            raise JenkinsHelperException(
+            raise JenkinsException(
                 f"call {job_name} job failed"
             ) from ej
 
@@ -191,6 +205,6 @@ class JenkinsHelper:
                 password=self._cs.get_jenkins_token(),
             )
         except JenkinsException as ej:
-            raise JenkinsHelperException(
+            raise JenkinsException(
                 "failed to init jenkins server"
             ) from ej

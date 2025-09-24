@@ -1,11 +1,9 @@
 reviewers:
   - rioliu-rh
-  - jianzhangbjz
   - tomasdavidorg
   - LuboTerifaj
   - jhuttana
   - barboras7
-  - ltroiano-rh
   - ming1013
   - cardelearht
 approvers:
@@ -13,4 +11,3 @@ approvers:
   - tomasdavidorg
   - jhuttana
   - ming1013
-  - jianzhangbjz

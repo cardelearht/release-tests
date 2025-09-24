@@ -1,7 +1,8 @@
-import streamlit as st
-import pandas as pd
-import os
 import json
+import os
+
+import pandas as pd
+import streamlit as st
 from github import Github, Auth
 
 # Define the github access variables
@@ -29,7 +30,12 @@ def get_col_state(file_content):
     Get job state: Accepted, Rejected, Pending
     """
     if 'accepted' in file_content:
-        accepted = 'Accepted' if file_content['accepted'] else 'Rejected'
+        if file_content['accepted']:
+            accepted = 'Accepted'
+        elif 'manual_promotion' in file_content:
+            accepted = 'Accepted (Manually Promoted)'
+        else:
+            accepted = 'Rejected'
     else:
         accepted = 'Pending'
 
@@ -49,14 +55,14 @@ def get_col_test_summary(file_content):
     for job in job_result:
         results = []
         first_job = job['firstJob']
-        if 'jobState' not in first_job:
+        if 'jobURL' not in first_job:
             # it means the job is just triggered, skip this file
             continue
         results.append(first_job['jobState'])
         job_links.append(first_job['jobURL'])
         if 'retriedJobs' in job:
             for retried_job in job['retriedJobs']:
-                if 'jobState' not in retried_job:
+                if 'jobURL' not in retried_job:
                     continue
                 results.append(retried_job['jobState'])
                 job_links.append(retried_job['jobURL'])
@@ -107,14 +113,14 @@ def load_test_results(release='4.12'):
 
 # start to write page elements
 st.set_page_config(layout='wide')
-st.markdown("<h2 style='text-align: center; color: black;'>Auto Release Test Results</h2>",
+st.markdown("<h2 style='text-align: center'>Auto Release Test Results</h2>",
             unsafe_allow_html=True)
 cola, colb = st.columns(2, vertical_alignment='bottom')
 # define a select box to choose minor release, don't load all the test results together
 with cola:
     release = st.selectbox(
         'Choose minor release',
-        ("4.12", "4.13", "4.14", "4.15", "4.16")
+        ("4.12", "4.13", "4.14", "4.15", "4.16", "4.17", "4.18", "4.19", "4.20")
     )
 # clear cache manually if you want to get latest results
 with colb:

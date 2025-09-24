@@ -1,14 +1,16 @@
-import requests
 import json
-import yaml
-import os
 import logging
-import oar.core.util as util
-from oar.core.exceptions import ConfigStoreException
-from oar.core.const import *
+import os
+
+import requests
+import yaml
+from jose import jwe
 from requests.exceptions import RequestException
 from yaml import YAMLError
-from jose import jwe
+
+import oar.core.util as util
+from oar.core.const import *
+from oar.core.exceptions import ConfigStoreException
 
 # get module level logger
 logger = logging.getLogger(__name__)
@@ -28,9 +30,9 @@ class ConfigStore:
         if release == "":
             raise ConfigStoreException("argument release is required")
 
-        if not util.is_valid_z_release(release):
+        if not util.validate_release_version(release):
             raise ConfigStoreException(
-                f"invalid z-stream release format {release}")
+                f"invalid release format {release}")
 
         self.release = release
 
@@ -58,8 +60,9 @@ class ConfigStore:
                 raise ConfigStoreException(
                     "ocp build data format is invalid") from ye
 
-        if self.release in self._build_data["releases"]:
-            self._assembly = self._build_data["releases"][self.release]["assembly"]
+        release_key = util.get_release_key(self.release)
+        if release_key in self._build_data["releases"]:
+            self._assembly = self._build_data["releases"][release_key]["assembly"]
         else:
             raise ConfigStoreException(
                 f"[{self.release}] ocp build data is not ready you can check file: {url}")
@@ -101,7 +104,7 @@ class ConfigStore:
         group:
             release_jira: ART-6626
         """
-        return self._assembly["group"]["release_jira"]
+        return self._get_assembly_attr("group/release_jira")
 
     def set_jira_ticket(self, key):
         """
@@ -262,6 +265,18 @@ class ConfigStore:
         """
         return self._get_env_var(ENV_VAR_SLACK_APP_TOKEN)
 
+    def get_gitlab_token(self):
+        """
+        Get gitlab token from env var GITLAB_TOKEN
+        """
+        return self._get_env_var(ENV_VAR_GITLAB_TOKEN)
+
+    def get_gitlab_url(self):
+        """
+        Get gitlab base url from local config
+        """
+        return self._local_conf["gitlab_url"]
+
     def get_google_app_passwd(self):
         """
         Get google account application password
@@ -279,6 +294,40 @@ class ConfigStore:
         Get release url
         """
         return self._local_conf["signature_url"]
+
+    def get_shipment_mr(self):
+        """Get shipment MR URL from assembly config.
+
+        Returns:
+            str: MR URL from assembly config (empty string if none found)
+        """
+        shipment = self._get_assembly_attr("group/shipment")
+        if not shipment:
+            return ""
+
+        return shipment["url"]
+
+    def is_konflux_flow(self) -> bool:
+        """Check if current release uses Konflux flow by verifying shipment MR exists.
+        
+        Returns:
+            bool: True if shipment MR exists (Konflux flow), False otherwise (Errata flow)
+        """
+        return bool(self.get_shipment_mr())
+
+
+    def get_advisories(self):
+        """
+        Get advisories info from build data e.g.
+        group:
+            advisories:
+                extras: 113027
+                image: 113026
+                metadata: 113028
+                rpm: 113025
+        """
+
+        return self._get_assembly_attr("group/advisories")
 
     def _get_env_var(self, var):
         """
@@ -303,13 +352,16 @@ class ConfigStore:
         we should get advisories from parent assembly i.e. 4.14.0
 
         Args:
-            keypath (_str_): attribute key path e.g. group/advisories!
+            keypath (str): attribute key path e.g. group/advisories!
         """
         attr_val = None
         basis = self._assembly["basis"]
         if "assembly" in basis:
             parent_assembly = self._get_value_by_path(
                 self._build_data["releases"], f"{basis['assembly']}/assembly")
+        else:
+            parent_assembly = None
+
         child_keypath = "%s!" % keypath
 
         attr_val = self._get_value_by_path(self._assembly, child_keypath)
@@ -326,8 +378,8 @@ class ConfigStore:
         e.g. releases/4.14.1/assembly
 
         Args:
-            json (_dict_): json object
-            path (_str_): attribute path based on current json object
+            json (dict): json object
+            path (str): attribute path based on current json object
         """
         tmp = json
         if tmp:

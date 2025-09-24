@@ -1,12 +1,14 @@
 from __future__ import annotations
-import requests
-import logging
+
 import json
+import logging
+from datetime import date, datetime, timedelta, timezone
+
+import requests
+from requests import Response
 from requests.adapters import HTTPAdapter
 from requests.exceptions import HTTPError
-from requests import Response
 from urllib3.util import Retry
-from datetime import date, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +193,10 @@ class ParamBuilder():
 
     def prow_job_run_id(self, prow_job_run_id):
         self._params.update(prow_job_run_id=prow_job_run_id)
+        return self
+
+    def view(self, name):
+        self._params.update(view=name)
         return self
 
     def done(self):
