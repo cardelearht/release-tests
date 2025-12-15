@@ -8,11 +8,13 @@ from jira import JIRA, Issue
 from jira.resources import User
 from datetime import datetime, timedelta, timezone
 from dateutil import parser
+from oar.core.jira import JiraIssue
 from oar.core.ldap import LdapHelper
 
 logger = logging.getLogger(__name__)
 
 ERT_NOTIFICATION_PREFIX = "Errata Reliability Team Notification"
+ERT_ALL_NOTIFIED_ONQA_PENDING_LABEL = "ert:pending-onqa-over-96hrs"
 
 class NotificationType(Enum):
     """
@@ -132,7 +134,39 @@ class NotificationService:
             self.jira.add_comment(notification.issue, notification.text)
         else:
             logger.info(f"Skipping sending {log_message}")
+            
+    def add_ert_all_notified_onqa_pending_label(self, issue: Issue) -> None:
+        """
+        Adds the ON_QA pending label to the issue.
 
+        Args:
+            issue (Issue): The JIRA issue to add the label to.
+        """
+
+        current_labels = issue.fields.labels
+        if ERT_ALL_NOTIFIED_ONQA_PENDING_LABEL not in current_labels:
+            current_labels.append(ERT_ALL_NOTIFIED_ONQA_PENDING_LABEL)
+            issue.update(fields={"labels": current_labels})
+            logger.info(f"ON_QA pending label added to the issue {issue.key}.")
+        else:
+            logger.info(f"ON_QA pending label already exists on the issue {issue.key}.")
+
+    def remove_ert_all_notified_onqa_pending_label(self, issue: Issue) -> None:
+        """
+        Removes the ON_QA pending label from the issue.
+
+        Args:
+            issue (Issue): The JIRA issue to remove the label from.
+        """
+
+        current_labels = issue.fields.labels
+        if ERT_ALL_NOTIFIED_ONQA_PENDING_LABEL in current_labels:
+            current_labels.remove(ERT_ALL_NOTIFIED_ONQA_PENDING_LABEL)
+            issue.update(fields={"labels": current_labels})
+            logger.info(f"ON_QA pending label removed from the issue {issue.key}.")
+        else:
+            logger.info(f"ON_QA pending label does not exist on the issue {issue.key}.")
+            
     def find_user_by_email(self, email: str) -> Optional[User]:
         """
         Searches for a JIRA user by email address.
@@ -208,6 +242,24 @@ class NotificationService:
             logger.warning(f"Issue {issue.key} does not have an Assignee.")
             return None
 
+    def add_user_to_need_info_from(self, issue: Issue, user: User) -> None:
+        """
+        Adds a user to the need info from field.
+
+        Args:
+            issue (Issue): The JIRA issue to add the user to.
+            user (User): The user to add to the need info from field.
+        """
+        if self.dry_run:
+            logger.info(f"Skipping adding {user.emailAddress} to need info from field. Issue {issue.key}.")
+        else:
+            logger.info(f"Adding {user.emailAddress} to need info from field. Issue {issue.key}.")
+            jira_issue = JiraIssue(issue)
+            need_info_from = jira_issue.get_need_info_from() or []
+            updated_users = [u.raw for u in need_info_from]
+            updated_users.append(user.raw)
+            jira_issue.set_need_info_from(updated_users)
+
     def create_assignee_notification_text(self, missing_contact: Contact, notified_assignees: list[User]) -> str:
         """
         Creates a notification text for assignees when a contact is missing.
@@ -270,8 +322,10 @@ class NotificationService:
             if assignee:
                 notified_assignees = [assignee]
                 assignee_manager = self.get_manager(assignee)
+                self.add_user_to_need_info_from(issue, assignee)
                 if assignee_manager:
                     notified_assignees.append(assignee_manager)
+                    self.add_user_to_need_info_from(issue, assignee_manager)
                 assignee_notification = Notification(
                     issue, 
                     NotificationType.ASSIGNEE, 
@@ -320,6 +374,7 @@ class NotificationService:
                 self.create_qa_notification_text(qa_contact)
             )
             self.process_notification(qa_notification)
+            self.add_user_to_need_info_from(issue, qa_contact)
             return qa_notification
         else:
             logger.warning("QA contact is missing. Assignees will be notified.")
@@ -363,6 +418,7 @@ class NotificationService:
                 self.create_team_lead_notification_text(qa_contact)
             )
             self.process_notification(team_lead_notification)
+            self.add_user_to_need_info_from(issue, qa_contact)
             return team_lead_notification
         else:
             logger.warning("QA contact is missing. Assignees will be notified.")
@@ -405,6 +461,7 @@ class NotificationService:
                     self.create_manager_notification_text(manager)
                 )
                 self.process_notification(manager_notification)
+                self.add_user_to_need_info_from(issue, manager)
                 return manager_notification
             else:
                 logger.warning("Manager was not found. Assignees will be notified.")
@@ -509,37 +566,45 @@ class NotificationService:
             Optional[Notification]: The created notification if sent, otherwise None.
         """
 
-        try:
-            on_qa_datetime = self.get_latest_on_qa_transition_datetime(issue)
-            if not on_qa_datetime:
-                logger.error(f"Issue {issue.key} does not have ON_QA transition date")
-                return None
+        on_qa_datetime = self.get_latest_on_qa_transition_datetime(issue)
+        if not on_qa_datetime:
+            logger.error(f"Issue {issue.key} does not have ON_QA transition date")
+            return None
+        logger.info(f"Issue {issue.key} has ON_QA transition date: {on_qa_datetime}")
+
+        notification_dates = self.get_latest_notification_dates_after_on_qa_transition(issue, on_qa_datetime)
+
+        if not notification_dates.get(NotificationType.QA_CONTACT):
+            logger.info("Removing ON_QA pending label.")
+            self.remove_ert_all_notified_onqa_pending_label(issue)  # Issue can be again in ON_QA state.
             
-            notification_dates = self.get_latest_notification_dates_after_on_qa_transition(issue, on_qa_datetime)
-
-            if not notification_dates.get(NotificationType.QA_CONTACT):
-                if self.is_more_than_24_weekday_hours(on_qa_datetime):
-                    logger.info("Notifying QA Contact")
-                    return self.notify_qa_contact(issue)
-                else:
-                    logger.info("Skipping notifying QA Contact - less than 24 hour from transition to ON_QA.")
-            elif not notification_dates.get(NotificationType.TEAM_LEAD): 
-                if self.is_more_than_24_weekday_hours(notification_dates.get(NotificationType.QA_CONTACT)):
-                    logger.info("Notifying Team Lead")
-                    return self.notify_team_lead(issue)
-                else:
-                    logger.info("Skipping notifying Team Lead - less than 24 hour from QA Contact notification.")
-            elif not notification_dates.get(NotificationType.MANAGER):
-                if self.is_more_than_24_weekday_hours(notification_dates.get(NotificationType.TEAM_LEAD)):
-                    logger.info("Notifying Manager")
-                    return self.notify_manager(issue)
-                else:
-                    logger.info("Skipping notifying Manager - less than 24 hour from Team Lead notification.")
+            if self.is_more_than_24_weekday_hours(on_qa_datetime):
+                logger.info("Notifying QA Contact")
+                return self.notify_qa_contact(issue)
             else:
-                logger.warning("All contacts have been notified.")
-
-        except Exception as e:
-            logger.error(f"An error occured while processing the Issue {issue.key}: {e}")
+                logger.info("Skipping notifying QA Contact - less than 24 hour from transition to ON_QA.")
+        elif not notification_dates.get(NotificationType.TEAM_LEAD): 
+            logger.info(f"Issue {issue.key} has QA Contact notification date: {notification_dates.get(NotificationType.QA_CONTACT)}")
+            if self.is_more_than_24_weekday_hours(notification_dates.get(NotificationType.QA_CONTACT)):
+                logger.info("Notifying Team Lead")
+                return self.notify_team_lead(issue)
+            else:
+                logger.info("Skipping notifying Team Lead - less than 24 hour from QA Contact notification.")
+        elif not notification_dates.get(NotificationType.MANAGER):
+            logger.info(f"Issue {issue.key} has Team Lead notification date: {notification_dates.get(NotificationType.TEAM_LEAD)}")
+            if self.is_more_than_24_weekday_hours(notification_dates.get(NotificationType.TEAM_LEAD)):
+                logger.info("Notifying Manager")
+                return self.notify_manager(issue)
+            else:
+                logger.info("Skipping notifying Manager - less than 24 hour from Team Lead notification.")
+        else:
+            logger.info(f"Issue {issue.key} has Manager notification date: {notification_dates.get(NotificationType.MANAGER)}")
+            logger.info("All contacts have been notified.")
+            if self.is_more_than_24_weekday_hours(notification_dates.get(NotificationType.MANAGER)):
+                logger.info("Adding ON_QA pending label to the issue.")
+                self.add_ert_all_notified_onqa_pending_label(issue)
+            else:
+                logger.info("Skipping adding ON_QA pending label - less than 24 hour from Manager notification.")
 
         return None
 
@@ -556,7 +621,7 @@ class NotificationService:
 
         base_filter = (
             "project = OCPBUGS AND issuetype in (Bug, Vulnerability) "
-            "AND status = ON_QA AND 'Target Version' in (4.12.z, 4.13.z, 4.14.z, 4.15.z, 4.16.z, 4.17.z, 4.18.z, 4.19.z)"
+            "AND status = ON_QA AND 'Target Version' in (4.12.z, 4.13.z, 4.14.z, 4.15.z, 4.16.z, 4.17.z, 4.18.z, 4.19.z, 4.20.z)"
         )
 
         date_suffix = f" AND status changed to ON_QA after {from_date.strftime('%Y-%m-%d')}" if from_date else ""
@@ -602,12 +667,20 @@ class NotificationService:
             List[Notification]: List of successfully sent notifications.
         """
         sent_notifications: list[Notification] = []
+        error_occurred = False
 
         for issue in self.get_on_qa_issues(search_batch_size, from_date):
             logger.info(f"Processing issue: {issue.key}")
-            notification = self.check_issue_and_notify_responsible_people(issue)
+            try:
+                notification = self.check_issue_and_notify_responsible_people(issue)
+            except Exception as e:
+                logger.error(f"An error occured while processing the Issue {issue.key}: {e}")
+                error_occurred = True
             if notification:
                 sent_notifications.append(notification)
+
+        if error_occurred:
+            raise RuntimeError("An error occured while processing the issues. See the logs for details.")
 
         return sent_notifications
 

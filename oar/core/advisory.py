@@ -266,8 +266,9 @@ class AdvisoryManager:
             rhsa_jira_issues = []
             for ad in rhsa_ads:
                 rhsa_jira_issues += ad.jira_issues
-            for trackers in json_obj.values():
-                if isinstance(trackers, list):
+            for key in ("rpm", "rhcos"):
+                trackers = json_obj.get(key)
+                if trackers and isinstance(trackers, list):
                     for tracker in trackers:
                         # add it to missed bug list if it is not attached on advisories
                         if tracker not in rhsa_jira_issues:
@@ -784,7 +785,7 @@ class Advisory(Erratum):
             return False
         #Download the commit metadata based on info in nvr.
         rhcos_nvr_url = re.sub(r"-([\d.]+)-(\d+)$", r"/\1/\2", rhcos_nvr)
-        rhcos_nvr_url_full = "https://download.eng.bos.redhat.com/brewroot/packages/"+rhcos_nvr_url+"/metadata.json"
+        rhcos_nvr_url_full = "https://download.engineering.redhat.com/brewroot/packages/"+rhcos_nvr_url+"/metadata.json"
         rhos_meta_data_full = self._get(rhcos_nvr_url_full)
         kernel_build = [
             f"{comp['name']}-{comp['version']}-{comp['release']}"

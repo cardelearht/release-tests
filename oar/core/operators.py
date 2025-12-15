@@ -9,15 +9,33 @@ import sys
 import oar.core.util as util
 
 from typing import Union
-from oar.core.advisory import AdvisoryManager
+from oar.core.advisory import AdvisoryManager, Advisory
 from oar.core.configstore import ConfigStore
 from oar.core.jira import JiraManager
 from oar.core.notification import NotificationManager
 from oar.core.shipment import ShipmentData
+from oar.core.statebox import StateBox
 from oar.core.worksheet import WorksheetManager
 from oar.core.const import *
+from oar.core.exceptions import ShipmentDataException, WorksheetException
+from gspread.exceptions import WorksheetNotFound
 
 logger = logging.getLogger(__name__)
+
+class LogCaptureHandler(logging.Handler):
+    """Custom logging handler to capture log messages for background processes"""
+    
+    def __init__(self):
+        super().__init__()
+        self.log_messages = []
+        
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.log_messages.append(log_entry)
+        
+    def get_log_messages(self):
+        """Get all captured log messages"""
+        return self.log_messages
 
 class ReleaseOwnershipOperator:
     """Handles composite ownership operations across advisories and shipments"""
@@ -166,30 +184,31 @@ class ApprovalOperator:
         accessibility with proper timeout and notification handling.
         """
         TIMEOUT_DAYS = 2
-        
-        # Create a custom logger to capture messages
-        class LogCaptureHandler(logging.Handler):
-            def __init__(self):
-                super().__init__()
-                self.log_messages = []
-                
-            def emit(self, record):
-                log_entry = self.format(record)
-                self.log_messages.append(log_entry)
-                
-            def get_log_messages(self):
-                """Get all captured log messages"""
-                return self.log_messages
-        
+
+        # Initialize logging for subprocess FIRST (required for LogCaptureHandler to capture logs)
+        util.init_logging(logging.DEBUG)
+
         # Add the capture handler to the logger
         capture_handler = LogCaptureHandler()
         capture_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         capture_handler.setLevel(logging.DEBUG)  # Capture all log levels
         logger.addHandler(capture_handler)
         
-        # Get test report for current release
-        report = WorksheetManager(self._am._cs).get_test_report()
-        
+        # Initialize StateBox for task status updates
+        statebox = StateBox(self._am._cs)
+
+        # Get test report (Google Sheets) if available for backward compatibility
+        report = None
+        try:
+            report = WorksheetManager(self._am._cs).get_test_report()
+        except WorksheetException as e:
+            # Check if root cause is specifically WorksheetNotFound (expected for StateBox releases)
+            if isinstance(e.__cause__, WorksheetNotFound):
+                logger.info(f"Google Sheets worksheet not found (expected for StateBox releases): {e}")
+            else:
+                # Other worksheet errors (API failures, network issues) should fail
+                raise
+
         try:
             # Check if scheduler is already running using file lock
             if self._is_scheduler_running(minor_release):
@@ -252,33 +271,57 @@ class ApprovalOperator:
                     # Move advisories to REL_PREP
                     self._am.change_advisory_status()
                     
-                    # Update test report status to PASS
-                    try:
-                        report.update_task_status(LABEL_TASK_CHANGE_AD_STATUS, TASK_STATUS_PASS)
-                        report.update_task_status(LABEL_TASK_NIGHTLY_BUILD_TEST, TASK_STATUS_PASS)
-                        report.update_task_status(LABEL_TASK_SIGNED_BUILD_TEST, TASK_STATUS_PASS)
-                        logger.info("Test report status updated to PASS")
-                    except Exception as e:
-                        logger.error(f"Failed to update test report status: {str(e)}")
-                    
+                    # Update test report status to PASS (Google Sheets - backward compatibility)
+                    if report is not None:
+                        try:
+                            report.update_task_status(LABEL_TASK_CHANGE_AD_STATUS, TASK_STATUS_PASS)
+                            report.update_task_status(LABEL_TASK_NIGHTLY_BUILD_TEST, TASK_STATUS_PASS)
+                            report.update_task_status(LABEL_TASK_SIGNED_BUILD_TEST, TASK_STATUS_PASS)
+                            logger.info("Google Sheets test report status updated to PASS")
+                        except Exception as e:
+                            logger.error(f"Failed to update Google Sheets test report status: {str(e)}")
+
                     # Log success summary (will be captured by LogCaptureHandler)
                     logger.info("Release approval completed. Payload metadata URL is now accessible and advisories have been moved to REL_PREP.")
-                    
+
+                    # Update StateBox
+                    try:
+                        statebox.update_task(
+                            "change-advisory-status",
+                            status=TASK_STATUS_PASS,
+                            result="\n".join(capture_handler.get_log_messages())
+                        )
+                        logger.info("StateBox updated to PASS")
+                    except Exception as e:
+                        logger.error(f"Failed to update StateBox: {str(e)}")
+
                     # Send completion notification with full logs including summary
                     self._send_completion_notification(minor_release, success=True, log_messages=capture_handler.get_log_messages())
                 else:
                     logger.warning(f"Timeout reached after {TIMEOUT_DAYS} days, payload metadata URL still not accessible")
                     
-                    # Update test report status to FAIL for timeout
-                    try:
-                        report.update_task_status(LABEL_TASK_CHANGE_AD_STATUS, TASK_STATUS_FAIL)
-                        logger.info("Test report status updated to FAIL due to timeout")
-                    except Exception as e:
-                        logger.error(f"Failed to update test report status: {str(e)}")
-                    
+                    # Update test report status to FAIL for timeout (Google Sheets - backward compatibility)
+                    if report is not None:
+                        try:
+                            report.update_task_status(LABEL_TASK_CHANGE_AD_STATUS, TASK_STATUS_FAIL)
+                            logger.info("Google Sheets test report status updated to FAIL due to timeout")
+                        except Exception as e:
+                            logger.error(f"Failed to update Google Sheets test report status: {str(e)}")
+
                     # Log timeout summary (will be captured by LogCaptureHandler)
                     logger.warning(f"Release approval timeout. Payload metadata URL still not accessible after {TIMEOUT_DAYS} days.")
-                    
+
+                    # Update StateBox
+                    try:
+                        statebox.update_task(
+                            "change-advisory-status",
+                            status=TASK_STATUS_FAIL,
+                            result="\n".join(capture_handler.get_log_messages())
+                        )
+                        logger.info("StateBox updated to FAIL")
+                    except Exception as e:
+                        logger.error(f"Failed to update StateBox: {str(e)}")
+
                     # Send timeout notification with full logs including summary
                     self._send_completion_notification(minor_release, success=False, log_messages=capture_handler.get_log_messages())
             finally:
@@ -290,16 +333,28 @@ class ApprovalOperator:
         except Exception as e:
             logger.error(f"Background metadata checker failed: {str(e)}")
             
-            # Update test report status to FAIL for error
-            try:
-                report.update_task_status(LABEL_TASK_CHANGE_AD_STATUS, TASK_STATUS_FAIL)
-                logger.info("Test report status updated to FAIL due to error")
-            except Exception as update_error:
-                logger.error(f"Failed to update test report status: {str(update_error)}")
-            
+            # Update test report status to FAIL for error (Google Sheets - backward compatibility)
+            if report is not None:
+                try:
+                    report.update_task_status(LABEL_TASK_CHANGE_AD_STATUS, TASK_STATUS_FAIL)
+                    logger.info("Google Sheets test report status updated to FAIL due to error")
+                except Exception as update_error:
+                    logger.error(f"Failed to update Google Sheets test report status: {str(update_error)}")
+
             # Log error summary (will be captured by LogCaptureHandler)
             logger.error(f"Release approval failed with error: {str(e)}")
-            
+
+            # Update StateBox
+            try:
+                statebox.update_task(
+                    "change-advisory-status",
+                    status=TASK_STATUS_FAIL,
+                    result="\n".join(capture_handler.get_log_messages())
+                )
+                logger.info("StateBox updated to FAIL")
+            except Exception as statebox_error:
+                logger.error(f"Failed to update StateBox: {str(statebox_error)}")
+
             # Send error notification with full logs including summary
             self._send_completion_notification(minor_release, success=False, error=str(e), log_messages=capture_handler.get_log_messages())
         finally:
@@ -402,21 +457,31 @@ class ApprovalOperator:
                 os.makedirs(log_dir, exist_ok=True)
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 log_file = os.path.join(log_dir, f"metadata_checker_{minor_release}_{timestamp}.log")
-                
+
                 with open(log_file, 'w') as f:
                     f.write(f"Background metadata checker process started at {datetime.datetime.now()}\n")
                     f.write(f"Command: {' '.join(cmd)}\n")
                     f.write(f"Release: {minor_release}\n")
                     f.write("-" * 80 + "\n")
-                
-                process = subprocess.Popen(
-                    cmd, 
-                    start_new_session=True, 
-                    env=env,
-                    stdout=open(log_file, 'a'),
-                    stderr=subprocess.STDOUT,  # Combine stderr with stdout
-                    stdin=subprocess.DEVNULL
-                )
+
+                # Open log file for subprocess and close in parent immediately after fork
+                # This prevents parent process shutdown from affecting the detached subprocess
+                # See: OCPERT-209
+                log_fd = os.open(log_file, os.O_WRONLY | os.O_APPEND)
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        start_new_session=True,
+                        env=env,
+                        stdout=log_fd,
+                        stderr=subprocess.STDOUT,  # Combine stderr with stdout
+                        stdin=subprocess.DEVNULL,
+                        close_fds=True  # Close all FDs in parent after fork
+                    )
+                finally:
+                    # Close file descriptor in parent immediately
+                    # Subprocess still has it open via inherited FD
+                    os.close(log_fd)
                 
                 logger.info(f"Background metadata checker process started (PID: {process.pid}) - running independently after parent exit")
                 logger.info(f"Process output redirected to: {log_file}")
@@ -561,3 +626,168 @@ class NotificationOperator:
         except Exception as e:
             logger.error(f"Ownership change notification failed: {str(e)}")
             raise
+
+
+class ReleaseShipmentOperator:
+    """Handles checking if a release is fully shipped (Errata or Konflux flow)"""
+
+    def __init__(self, cs: ConfigStore):
+        self._cs = cs
+        self._am = AdvisoryManager(cs)
+
+        # Try to initialize ShipmentData
+        # For already shipped Konflux releases, MR is merged and ShipmentData will raise exception
+        self._sd = None
+        self._sd_init_error = None
+        try:
+            self._sd = ShipmentData(cs)
+        except ShipmentDataException as e:
+            # Store the error - "state is not open" means the MR is merged (shipped)
+            self._sd_init_error = str(e)
+            logger.info(f"ShipmentData initialization failed: {str(e)}")
+
+    def is_release_shipped(self) -> dict:
+        """
+        Check if a release is fully shipped.
+
+        For Konflux flow:
+        - Shipment MR must be either merged OR prod-release pipeline succeeded
+        - rpm advisory must be in REL_PREP or higher state
+        - rhcos advisory must be in REL_PREP or higher state
+
+        For Errata flow:
+        - All advisories (from ConfigStore) must be in REL_PREP or higher state
+
+        Returns:
+            dict: Status information with keys:
+                - shipped (bool): Whether release is fully shipped
+                - flow_type (str): "errata" or "konflux"
+                - details (dict): Detailed status for each component
+        """
+        try:
+            if self._cs.is_konflux_flow():
+                return self._check_konflux_shipped()
+            else:
+                return self._check_errata_shipped()
+        except Exception as e:
+            logger.error(f"Failed to check release shipment status: {str(e)}")
+            raise
+
+    def _check_advisories_shipped(self, details: dict) -> bool:
+        """Check if all advisories are shipped
+
+        Gets all advisories from ConfigStore and checks if their state is REL_PREP or higher.
+        For Konflux: returns rpm and rhcos advisories
+        For Errata: returns all advisories (extras, image, metadata, rpm, rhcos)
+
+        Args:
+            details (dict): Dictionary to store advisory status details
+
+        Returns:
+            bool: True if all advisories are shipped, False otherwise
+        """
+        all_shipped = True
+
+        try:
+            advisories_map = self._cs.get_advisories()
+
+            for impetus, errata_id in advisories_map.items():
+                try:
+                    ad = Advisory(errata_id=errata_id, impetus=impetus)
+                    ad_state = ad.get_state()
+                    details[f"{impetus}_advisory"] = ad_state
+
+                    # Check if advisory is in REL_PREP or higher state
+                    # REL_PREP or higher includes: REL_PREP, PUSH_READY, IN_PUSH, SHIPPED_LIVE
+                    if ad_state not in [AD_STATUS_REL_PREP, AD_STATUS_PUSH_READY, AD_STATUS_IN_PUSH, AD_STATUS_SHIPPED_LIVE]:
+                        all_shipped = False
+                        logger.warning(f"Advisory {errata_id} ({impetus}) is in state {ad_state}, not ready for ship")
+                except Exception as e:
+                    logger.warning(f"Failed to check {impetus} advisory: {str(e)}")
+                    details[f"{impetus}_advisory"] = f"error: {str(e)}"
+                    all_shipped = False
+
+        except Exception as e:
+            logger.warning(f"Failed to get advisories from ConfigStore: {str(e)}")
+            details["advisories_error"] = str(e)
+            all_shipped = False
+
+        return all_shipped
+
+    def _check_konflux_shipped(self) -> dict:
+        """Check shipment status for Konflux flow
+
+        Checks if either:
+        - prod-release pipeline succeeded, OR
+        - shipment MR is in merged state
+        Plus all advisories (rpm and rhcos) in REL_PREP or higher state
+        """
+        logger.info("Checking Konflux flow release shipment status")
+
+        details = {}
+        all_shipped = True
+
+        # If ShipmentData initialization failed, check why
+        if self._sd is None:
+            if self._sd_init_error and "state is not open" in self._sd_init_error:
+                # MR is not open = merged, which means shipped!
+                details["shipment_mr_status"] = "merged"
+                logger.info("ShipmentData not available - MR is merged (shipped)")
+            else:
+                # Some other error
+                details["shipment_mr_status"] = f"error: {self._sd_init_error}"
+                logger.warning(f"ShipmentData not available due to error: {self._sd_init_error}")
+                all_shipped = False
+        else:
+            # ShipmentData available, check prod release success OR shipment MR merged status
+            shipment_ready = False
+            try:
+                prod_success = self._sd.is_prod_release_success()
+                details["prod_release"] = "success" if prod_success else "not yet"
+                if prod_success:
+                    shipment_ready = True
+            except Exception as e:
+                logger.warning(f"Failed to check prod release: {str(e)}")
+                details["prod_release"] = f"error: {str(e)}"
+
+            # Also check if MR is merged
+            try:
+                mr_merged = self._sd.is_mr_merged()
+                details["shipment_mr_merged"] = "yes" if mr_merged else "no"
+                if mr_merged:
+                    shipment_ready = True
+            except Exception as e:
+                logger.warning(f"Failed to check MR merged status: {str(e)}")
+                details["shipment_mr_merged"] = f"error: {str(e)}"
+
+            if not shipment_ready:
+                all_shipped = False
+
+        # Check all advisories status
+        advisories_shipped = self._check_advisories_shipped(details)
+        if not advisories_shipped:
+            all_shipped = False
+
+        return {
+            "shipped": all_shipped,
+            "flow_type": "konflux",
+            "details": details
+        }
+
+    def _check_errata_shipped(self) -> dict:
+        """Check shipment status for Errata flow
+
+        Checks if all advisories are in REL_PREP or higher state
+        """
+        logger.info("Checking Errata flow release shipment status")
+
+        details = {}
+
+        # Check all advisories status
+        all_shipped = self._check_advisories_shipped(details)
+
+        return {
+            "shipped": all_shipped,
+            "flow_type": "errata",
+            "details": details
+        }

@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""
+CI Job Failure Fetcher
+
+Fetches detailed test failure information from OpenShift CI Prow jobs
+for AI-powered analysis by Claude Code.
+
+Usage:
+    python ci_job_failure_fetcher.py <prow_deck_url>
+
+Example:
+    python ci_job_failure_fetcher.py https://qe-private-deck-ci.apps.ci.l2s4.p1.openshiftapps.com/view/gs/qe-private-deck/logs/periodic-ci-openshift-openshift-tests-private-release-4.20-automated-release-aws-ipi-f999/1979765746749673472
+"""
+
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import tarfile
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
+from xml.etree import ElementTree
+
+# Add parent directory to path to import from prow package
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from prow.job.artifacts import Artifacts
+
+logger = logging.getLogger(__name__)
+
+# Configuration for AI token limit management
+MAX_FAILURES_FOR_AI = int(os.getenv('MAX_FAILURES_FOR_AI', '50'))  # Configurable via env var
+MAX_MESSAGE_LENGTH = 500  # Characters for error message
+MAX_DETAILS_LENGTH = 2000  # Characters for stack trace
+
+# Must-gather extraction configuration
+MUST_GATHER_EXTRACT_DIR = os.getenv('MUST_GATHER_EXTRACT_DIR', '/tmp')
+
+
+class CucushiftConsoleLogParser:
+    """Parser for cucushift-e2e build-log.txt to extract detailed trace logs for failed tests"""
+
+    def __init__(self, console_log: str):
+        """
+        Initialize parser with cucushift console log content.
+
+        Args:
+            console_log: Full content of cucushift-e2e/build-log.txt
+        """
+        self.console_log = console_log
+        self.lines = console_log.split('\n')
+
+    def extract_trace_for_scenario(self, scenario_name: str) -> Dict:
+        """
+        Extract full trace log for a specific failed Cucumber scenario.
+
+        Args:
+            scenario_name: Name of the failed scenario from JUnit XML
+
+        Returns:
+            Dictionary with trace information including:
+            - full_trace: Complete trace log for the scenario
+            - error_snippet: Key error message excerpt
+            - feature_file: Feature file path if found
+            - line_number: Line number in feature file if found
+        """
+        trace_info = {
+            'scenario_name': scenario_name,
+            'full_trace': None,
+            'error_snippet': None,
+            'feature_file': None,
+            'line_number': None,
+            'found': False
+        }
+
+        # Search for scenario name in console log
+        scenario_start_idx = None
+        for i, line in enumerate(self.lines):
+            # Cucumber scenario markers: "Scenario: <name>" or "cucumber features/..."
+            if f"Scenario: {scenario_name}" in line or scenario_name in line:
+                scenario_start_idx = i
+                break
+
+        if scenario_start_idx is None:
+            logger.warning(f"Could not find scenario '{scenario_name}' in cucushift console log")
+            return trace_info
+
+        # Extract trace from scenario start to next scenario or end
+        trace_lines = []
+        error_lines = []
+
+        # Look backwards to capture any setup logs
+        lookback_start = max(0, scenario_start_idx - 50)
+
+        # Look forward to capture full trace (typically 100-500 lines for failures)
+        lookforward_end = min(len(self.lines), scenario_start_idx + 500)
+
+        for i in range(lookback_start, lookforward_end):
+            line = self.lines[i]
+            trace_lines.append(line)
+
+            # Capture error indicators - look for key error/failure keywords
+            lower_line = line.lower()
+            if any(keyword in lower_line for keyword in ['error', 'fail', 'panic', 'exception', 'traceback']):
+                error_lines.append(line)
+
+            # Extract feature file info from Cucumber output
+            # Format: "cucumber features/xxx.feature:123"
+            if 'cucumber features/' in line:
+                import re
+                match = re.search(r'cucumber (features/[^:]+):(\d+)', line)
+                if match:
+                    trace_info['feature_file'] = match.group(1)
+                    trace_info['line_number'] = match.group(2)
+
+            # Stop at next scenario
+            if i > scenario_start_idx and line.strip().startswith('Scenario:'):
+                break
+
+        if trace_lines:
+            trace_info['full_trace'] = '\n'.join(trace_lines)
+            trace_info['error_snippet'] = '\n'.join(error_lines[:10]) if error_lines else None
+            trace_info['found'] = True
+
+        return trace_info
+
+
+class DetailedJunitTestCase:
+    """Extended JUnit test case parser that extracts failure messages and stack traces"""
+
+    def __init__(self, element):
+        self._element = element
+
+    @property
+    def name(self):
+        return self._element.attrib.get("name", "Unknown")
+
+    @property
+    def classname(self):
+        return self._element.attrib.get("classname", "")
+
+    @property
+    def time(self):
+        return self._element.attrib.get("time", "0")
+
+    def is_failure(self):
+        return self._element.find("failure") is not None
+
+    def is_error(self):
+        return self._element.find("error") is not None
+
+    def get_failure_info(self) -> Dict:
+        """Extract detailed failure information including message and stack trace"""
+        failure_elem = self._element.find("failure")
+        error_elem = self._element.find("error")
+
+        if failure_elem is not None:
+            elem = failure_elem
+            failure_type = "failure"
+        elif error_elem is not None:
+            elem = error_elem
+            failure_type = "error"
+        else:
+            return None
+
+        # Truncate message and details to reduce token usage
+        message = elem.attrib.get("message", "")
+        details = elem.text or ""
+
+        return {
+            "type": failure_type,
+            "message": message[:MAX_MESSAGE_LENGTH] + ("..." if len(message) > MAX_MESSAGE_LENGTH else ""),
+            "details": details[:MAX_DETAILS_LENGTH] + ("..." if len(details) > MAX_DETAILS_LENGTH else ""),
+            "error_type": elem.attrib.get("type", "")
+        }
+
+
+def extract_must_gather(must_gather_tar: bytes, job_run_id: str) -> Optional[str]:
+    """
+    Extract must-gather archive to configured directory.
+
+    Args:
+        must_gather_tar: The must-gather.tar file content as bytes
+        job_run_id: The Prow job run ID for unique directory naming
+
+    Returns:
+        Path to the extraction directory (e.g., /tmp/must-gather-{job_run_id}),
+        or None if extraction failed
+
+    Note:
+        Uses MUST_GATHER_EXTRACT_DIR environment variable (default: /tmp)
+        omc will automatically find the must-gather subdirectory
+    """
+    # Create extraction directory
+    extract_dir = f"{MUST_GATHER_EXTRACT_DIR}/must-gather-{job_run_id}"
+
+    try:
+        # Clean up existing directory if it exists
+        if os.path.exists(extract_dir):
+            logger.info(f"Removing existing must-gather directory: {extract_dir}")
+            shutil.rmtree(extract_dir)
+
+        # Create directory
+        os.makedirs(extract_dir, exist_ok=True)
+        logger.info(f"Created must-gather extraction directory: {extract_dir}")
+
+        # Write tar file to temp location
+        tar_path = f"{extract_dir}/must-gather.tar"
+        with open(tar_path, 'wb') as f:
+            f.write(must_gather_tar)
+
+        # Extract tar file
+        logger.info(f"Extracting must-gather archive to {extract_dir}")
+        with tarfile.open(tar_path, 'r') as tar:
+            tar.extractall(path=extract_dir)
+
+        # Remove the tar file after extraction
+        os.remove(tar_path)
+
+        logger.info(f"Successfully extracted must-gather to {extract_dir}")
+        return extract_dir
+
+    except Exception as e:
+        logger.error(f"Failed to extract must-gather: {e}")
+        return None
+
+
+class CIJobFailureFetcher:
+    """Fetches and parses CI job failures with detailed information for AI analysis"""
+
+    def __init__(self, prow_deck_url: str, gcs_cred_file: str = None):
+        self.prow_deck_url = prow_deck_url
+        self.gcs_cred_file = gcs_cred_file or os.getenv('GCS_CRED_FILE')
+
+        if not self.gcs_cred_file:
+            raise ValueError("GCS_CRED_FILE environment variable must be set")
+
+        if not os.path.exists(self.gcs_cred_file):
+            raise FileNotFoundError(f"GCS credentials file not found: {self.gcs_cred_file}")
+
+        # Parse job info from URL
+        self.job_name, self.job_run_id, self.bucket = self._parse_prow_url(prow_deck_url)
+
+        # Initialize artifacts client
+        self.artifacts = Artifacts(
+            cred_file=self.gcs_cred_file,
+            job_name=self.job_name,
+            job_run_id=self.job_run_id,
+            bucket=self.bucket
+        )
+
+    def _group_failures_by_pattern(self, failures: List[Dict]) -> List[Dict]:
+        """
+        Group failures with similar error signatures to identify patterns.
+
+        Returns:
+            List of grouped failure patterns with representative examples
+        """
+        if not failures:
+            return []
+
+        # Group by error signature (message + error_type)
+        groups = defaultdict(list)
+        for failure in failures:
+            # Create signature from error message (first 200 chars) + error type
+            signature = f"{failure['error_type']}:{failure['message'][:200]}"
+            groups[signature].append(failure)
+
+        # Convert to grouped format with representative samples
+        grouped_failures = []
+        for signature, items in sorted(groups.items(), key=lambda x: len(x[1]), reverse=True):
+            # Take the first item as representative
+            representative = items[0].copy()
+
+            grouped_failures.append({
+                "pattern_signature": signature[:100],  # Truncate for readability
+                "occurrence_count": len(items),
+                "representative_failure": representative,
+                "affected_tests": [f['test_name'] for f in items[:10]],  # Max 10 examples
+                "all_test_count": len(items),
+                "suites": list(set(f['suite'] for f in items))[:5]  # Up to 5 unique suites
+            })
+
+        return grouped_failures
+
+    def _parse_prow_url(self, url: str) -> Tuple[str, str, str]:
+        """Parse Prow deck URL to extract job name, run ID, and bucket"""
+        # Pattern: /view/gs/{bucket}/logs/{job_name}/{job_run_id}
+        pattern = r'/view/gs/([^/]+)/logs/([^/]+)/(\d+)'
+        match = re.search(pattern, url)
+
+        if not match:
+            raise ValueError(f"Invalid Prow deck URL format: {url}")
+
+        bucket = match.group(1)
+        job_name = match.group(2)
+        job_run_id = match.group(3)
+
+        return job_name, job_run_id, bucket
+
+    def fetch_failures(self) -> Dict:
+        """
+        Fetch detailed failure information from JUnit XML files
+
+        Returns:
+            Dictionary with comprehensive failure data for AI analysis
+        """
+        logger.info(f"Fetching test results for job {self.job_name}, run ID {self.job_run_id}")
+
+        # Fetch JUnit files from GCS
+        junit_files = self.artifacts.get_junit_files()
+        logger.info(f"Found {len(junit_files)} JUnit XML files" if junit_files else "No JUnit XML files found")
+
+        if not junit_files:
+            # No JUnit files - likely infrastructure/setup failure
+            # Fetch build log for analysis
+            logger.info("Attempting to fetch build log for infrastructure failure analysis")
+            build_log = None
+            try:
+                build_log = self.artifacts.get_build_log()
+                logger.info(f"Successfully fetched build log ({len(build_log)} bytes)")
+            except Exception as e:
+                logger.warning(f"Could not fetch build log: {e}")
+
+            return {
+                'job_name': self.job_name,
+                'job_run_id': self.job_run_id,
+                'error': 'No JUnit XML files found - likely infrastructure or setup failure',
+                'build_log_url': self._get_build_log_url(),
+                'build_log_snippet': build_log[-20000:] if build_log else None,  # Last 20KB for errors
+                'gcsweb_url': self._get_gcsweb_url(),
+                'analysis_type': 'infrastructure_failure'
+            }
+
+        # Parse all test results
+        logger.info("Parsing JUnit XML files for test results")
+        total_tests = 0
+        passed_tests = 0
+        failed_tests = 0
+        error_tests = 0
+        skipped_tests = 0
+        failures = []
+        suites_info = []
+
+        for junit_blob in junit_files:
+            # Parse XML
+            xml_content = junit_blob.download_as_bytes().decode("utf-8")
+            root = ElementTree.fromstring(xml_content)
+
+            # Get suite info
+            suite_name = root.attrib.get("name", "Unknown Suite")
+            suite_tests = int(root.attrib.get("tests", "0"))
+            suite_failures = int(root.attrib.get("failures", "0"))
+            suite_errors = int(root.attrib.get("errors", "0"))
+            suite_skipped = int(root.attrib.get("skipped", "0"))
+
+            total_tests += suite_tests
+            failed_tests += suite_failures
+            error_tests += suite_errors
+            skipped_tests += suite_skipped
+
+            suites_info.append({
+                "name": suite_name,
+                "tests": suite_tests,
+                "failures": suite_failures,
+                "errors": suite_errors,
+                "skipped": suite_skipped,
+                "source_file": junit_blob.name
+            })
+
+            # Extract detailed failure information
+            if suite_failures > 0 or suite_errors > 0:
+                test_cases = root.findall(".//testcase")
+                for tc_elem in test_cases:
+                    tc = DetailedJunitTestCase(tc_elem)
+                    if tc.is_failure() or tc.is_error():
+                        failure_info = tc.get_failure_info()
+                        failures.append({
+                            "test_name": tc.name,
+                            "classname": tc.classname,
+                            "suite": suite_name,
+                            "duration": tc.time,
+                            "failure_type": failure_info["type"],
+                            "error_type": failure_info["error_type"],
+                            "message": failure_info["message"],
+                            "details": failure_info["details"],
+                            "source_file": junit_blob.name
+                        })
+
+        passed_tests = total_tests - failed_tests - error_tests - skipped_tests
+
+        logger.info(f"Test result summary: {total_tests} total, {passed_tests} passed, {failed_tests} failed, {error_tests} errors, {skipped_tests} skipped")
+        if failed_tests > 0 or error_tests > 0:
+            logger.warning(f"Found {len(failures)} failed test case(s)")
+
+        # Detect and enrich cucushift failures with full trace logs
+        has_cucushift = self._detect_cucushift_failures(suites_info)
+        if has_cucushift and failures:
+            logger.info("Detected cucushift test failures - enriching with console log traces")
+            failures = self._enrich_cucushift_failures(failures)
+
+        # Group failures by pattern to identify common issues
+        failure_patterns = self._group_failures_by_pattern(failures)
+        logger.info(f"Identified {len(failure_patterns)} unique failure patterns")
+
+        # Determine if we need to truncate for AI analysis
+        total_failure_count = len(failures)
+        is_truncated = total_failure_count > MAX_FAILURES_FOR_AI
+
+        # Select failures to send to AI
+        if is_truncated:
+            # Prioritize by pattern frequency - include representative failures from each pattern
+            ai_failures = []
+            remaining_quota = MAX_FAILURES_FOR_AI
+
+            for pattern in failure_patterns:
+                if remaining_quota <= 0:
+                    break
+                # Add representative failure from this pattern
+                ai_failures.append(pattern['representative_failure'])
+                remaining_quota -= 1
+
+            logger.warning(f"Truncated from {total_failure_count} to {len(ai_failures)} failures for AI analysis")
+        else:
+            ai_failures = failures
+
+        return {
+            'job_name': self.job_name,
+            'job_run_id': self.job_run_id,
+            'prow_deck_url': self.prow_deck_url,
+            'gcsweb_url': self._get_gcsweb_url(),
+            'summary': {
+                'total_tests': total_tests,
+                'passed': passed_tests,
+                'failed': failed_tests,
+                'errors': error_tests,
+                'skipped': skipped_tests,
+                'junit_files': len(junit_files),
+                'total_failures': total_failure_count,
+                'unique_patterns': len(failure_patterns),
+                'is_truncated': is_truncated
+            },
+            'suites': suites_info,
+            'failure_patterns': failure_patterns,  # Grouped view for pattern analysis
+            'failures': ai_failures,  # Individual failures (truncated if needed)
+            'truncation_info': {
+                'is_truncated': is_truncated,
+                'original_count': total_failure_count,
+                'analyzed_count': len(ai_failures),
+                'max_limit': MAX_FAILURES_FOR_AI
+            } if is_truncated else None
+        }
+
+    def _get_gcsweb_domain(self) -> str:
+        """Get the GCS web domain based on bucket name"""
+        if 'qe-private-deck' in self.bucket:
+            return 'gcsweb-qe-private-deck-ci.apps.ci.l2s4.p1.openshiftapps.com'
+        else:
+            return 'gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com'
+
+    def _get_gcsweb_url(self) -> str:
+        """Get the GCS web URL for the job artifacts"""
+        return f"https://{self._get_gcsweb_domain()}/gcs/{self.bucket}/logs/{self.job_name}/{self.job_run_id}/artifacts/"
+
+    def _get_build_log_url(self) -> str:
+        """Get the GCS web URL for the build log"""
+        return f"https://{self._get_gcsweb_domain()}/gcs/{self.bucket}/logs/{self.job_name}/{self.job_run_id}/build-log.txt"
+
+    def _detect_cucushift_failures(self, suites_info: List[Dict]) -> bool:
+        """
+        Detect if this job has cucushift test failures.
+
+        Args:
+            suites_info: List of test suite information
+
+        Returns:
+            True if cucushift failures detected
+        """
+        for suite in suites_info:
+            if 'cucushift' in suite.get('source_file', '').lower():
+                return True
+        return False
+
+    def _enrich_cucushift_failures(self, failures: List[Dict]) -> List[Dict]:
+        """
+        Enrich cucushift test failures with full trace logs from console.
+
+        Args:
+            failures: List of failure dictionaries from JUnit XML
+
+        Returns:
+            Enriched failures list with full_trace added to cucushift failures
+        """
+        # Try to fetch cucushift console log
+        try:
+            console_log = self.artifacts.get_cucushift_build_log()
+            logger.info(f"Successfully fetched cucushift console log ({len(console_log)} bytes)")
+            parser = CucushiftConsoleLogParser(console_log)
+        except FileNotFoundError as e:
+            logger.warning(f"Cucushift console log not found: {e}")
+            return failures
+        except Exception as e:
+            logger.error(f"Error fetching cucushift console log: {e}")
+            return failures
+
+        # Enrich each cucushift failure with trace log
+        enriched_failures = []
+        for failure in failures:
+            # Check if this is a cucushift failure
+            if 'cucushift' in failure.get('source_file', '').lower():
+                # Extract trace for this scenario
+                trace_info = parser.extract_trace_for_scenario(failure['test_name'])
+
+                if trace_info['found']:
+                    # Add trace information to failure
+                    failure['cucushift_trace'] = {
+                        'full_trace': trace_info['full_trace'][:5000],  # Limit to 5K chars
+                        'error_snippet': trace_info['error_snippet'],
+                        'feature_file': trace_info['feature_file'],
+                        'line_number': trace_info['line_number']
+                    }
+                    logger.info(f"Enriched cucushift failure '{failure['test_name']}' with trace log")
+                else:
+                    logger.warning(f"Could not find trace for cucushift scenario '{failure['test_name']}'")
+
+            enriched_failures.append(failure)
+
+        return enriched_failures
+
+    def setup_must_gather_analysis(self) -> Dict:
+        """
+        Download and extract must-gather for AI-powered debugging.
+
+        Returns:
+            Dictionary with must-gather extraction information
+        """
+        logger.info("Attempting to fetch must-gather archive")
+
+        try:
+            # Fetch must-gather archive
+            must_gather_tar = self.artifacts.get_must_gather()
+            logger.info(f"Successfully fetched must-gather archive ({len(must_gather_tar)} bytes)")
+
+            # Extract to configured directory
+            extract_path = extract_must_gather(must_gather_tar, self.job_run_id)
+
+            if extract_path:
+                return {
+                    'available': True,
+                    'must_gather_dir': extract_path,
+                    'extracted': True
+                }
+            else:
+                return {
+                    'available': False,
+                    'reason': 'Failed to extract must-gather archive',
+                    'must_gather_downloaded': True
+                }
+
+        except FileNotFoundError as e:
+            logger.warning(f"Must-gather not found: {e}")
+            return {
+                'available': False,
+                'reason': 'must-gather.tar not found in job artifacts',
+                'note': 'Job may not have a gather-must-gather step'
+            }
+        except Exception as e:
+            logger.error(f"Error during must-gather extraction: {e}")
+            return {
+                'available': False,
+                'reason': f'Error during extraction: {str(e)}'
+            }
+
+
+def main():
+    """Main entry point for CLI usage"""
+    # Initialize logging
+    logging.basicConfig(
+        format="%(asctime)s: %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+        level=logging.WARNING,  # Only show warnings and errors to stderr
+    )
+
+    if len(sys.argv) < 2:
+        print("Usage: python ci_job_failure_fetcher.py <prow_deck_url> [--setup-must-gather]", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Options:", file=sys.stderr)
+        print("  --setup-must-gather: Download and setup must-gather for omc analysis", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Environment variables:", file=sys.stderr)
+        print("  GCS_CRED_FILE: Path to Google Cloud Storage credentials file (required)", file=sys.stderr)
+        sys.exit(1)
+
+    prow_url = sys.argv[1]
+    setup_must_gather_flag = '--setup-must-gather' in sys.argv
+
+    try:
+        fetcher = CIJobFailureFetcher(prow_url)
+        results = fetcher.fetch_failures()
+
+        # Setup must-gather if requested
+        if setup_must_gather_flag:
+            must_gather_info = fetcher.setup_must_gather_analysis()
+            results['must_gather'] = must_gather_info
+
+        # Output JSON to stdout for Claude Code to consume
+        print(json.dumps(results, indent=2))
+
+    except Exception as e:
+        error_output = {
+            'error': str(e),
+            'error_type': type(e).__name__
+        }
+        print(json.dumps(error_output, indent=2), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

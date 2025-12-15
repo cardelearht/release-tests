@@ -59,6 +59,25 @@ class NotificationManager:
         except Exception as e:
             raise NotificationException("share new report failed") from e
 
+    def share_new_statebox(self, statebox_url: str, release: str):
+        """
+        Send Slack message for newly created StateBox
+
+        Args:
+            statebox_url (str): GitHub URL to StateBox file
+            release (str): Release version
+
+        Raises:
+            NotificationException: error when share this info
+        """
+        try:
+            slack_msg = self.mh.get_slack_message_for_new_statebox(statebox_url, release)
+            self.sc.post_message(
+                self.cs.get_slack_channel_from_contact("qe-release"), slack_msg
+            )
+        except Exception as e:
+            raise NotificationException("share new statebox failed") from e
+
     def share_ownership_change_result(
         self, updated_ads, abnormal_ads, updated_subtasks, new_owner
     ):
@@ -387,20 +406,29 @@ class NotificationManager:
             self.sc.post_message(default_channel, summary_message)
             logger.info(f"Sent completion notification to default channel {default_channel}")
             
-            # If Slack context is available, also send full logs to specific thread
-            if slack_channel and slack_thread and log_messages:
-                # Send full log messages (which include the summary)
-                log_content = "\n".join(log_messages)
-                # Use utility function to split large messages
-                message_chunks = util.split_large_message(log_content)
-                for chunk in message_chunks:
+            # If Slack context is available, also send notification to specific thread
+            if slack_channel and slack_thread:
+                if log_messages:
+                    # Send full log messages (which include the summary)
+                    log_content = "\n".join(log_messages)
+                    # Use utility function to split large messages
+                    message_chunks = util.split_large_message(log_content)
+                    for chunk in message_chunks:
+                        self.sc.client.chat_postMessage(
+                            channel=slack_channel,
+                            thread_ts=slack_thread,
+                            text=f"```{chunk}```"
+                        )
+                    
+                    logger.info(f"Also sent full logs to thread {slack_thread} in channel {slack_channel}")
+                else:
+                    # Send summary message to thread when logs are not available
                     self.sc.client.chat_postMessage(
                         channel=slack_channel,
                         thread_ts=slack_thread,
-                        text=f"```{chunk}```"
+                        text=summary_message
                     )
-                
-                logger.info(f"Also sent full logs to thread {slack_thread} in channel {slack_channel}")
+                    logger.info(f"Sent summary to thread {slack_thread} in channel {slack_channel} (no logs available)")
                 
         except Exception as e:
             raise NotificationException("share release approval completion failed") from e
@@ -593,6 +621,25 @@ class MessageHelper:
         )
         linked_text = self._to_link(report.get_url(), "test report")
         return f"Hello {gid}, new {linked_text} is generated for {self.cs.release}"
+
+    def get_slack_message_for_new_statebox(self, statebox_url: str, release: str):
+        """
+        Generate Slack message for newly created StateBox
+
+        Args:
+            statebox_url (str): GitHub URL to StateBox file
+            release (str): Release version
+
+        Returns:
+            str: Slack message for new StateBox
+        """
+        gid = self.sc.get_group_id_by_name(
+            self.cs.get_slack_user_group_from_contact(
+                "qe-release", util.get_y_release(release)
+            )
+        )
+        linked_text = self._to_link(statebox_url, "StateBox")
+        return f"Hello {gid}, new {linked_text} is created for {release} release tracking"
 
     def get_slack_message_for_ownership_change(
         self, updated_ads, abnormal_ads, updated_subtasks, new_owner
