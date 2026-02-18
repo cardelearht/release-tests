@@ -1,0 +1,100 @@
+import logging
+import re
+import subprocess
+import json
+
+logger = logging.getLogger(__name__)
+
+class PayloadImage:
+    """
+    Represents an image in the payload with its name and pullspec.
+    """
+
+    def __init__(self, name: str, pullspec: str):
+        """
+        Initialize the PayloadImage object.
+        """
+        self.name = name
+        self.pullspec = pullspec
+
+class Payload:
+    """
+    Represents an OpenShift release payload and provides methods to get the images.
+
+    Class Attributes:
+        SKIPPED_IMAGES_REGEX (list[str]): List of regex patterns to skip when extracting images.
+    """
+
+    SKIPPED_IMAGES_REGEX = [
+        r"machine-os-content",
+        r"rhel-coreos(?:-\d+)?",
+        r"rhel-coreos(?:-\d+)?-extensions",
+    ]
+
+    # precompile the regex patterns
+    _SKIPPED_IMAGES_PATTERNS = [re.compile(r) for r in SKIPPED_IMAGES_REGEX]
+
+    def __init__(self, payload_url: str):
+        """
+        Initialize the Payload object.
+
+        Args:
+            payload_url (str): The URL of the OpenShift release payload
+        """
+        self._payload_data = self._fetch_payload_data(payload_url)
+        self.version = self._payload_data['metadata']['version']
+
+    def _fetch_payload_data(self, payload_url: str) -> dict:
+        """
+        Get the payload data from the payload URL.
+
+        Args:
+            payload_url (str): The URL of the OpenShift release payload
+
+        Returns:
+            dict: The payload data
+        """
+        logger.info(f"Fetching payload data from {payload_url}")
+        cmd = ["oc", "adm", "release", "info", "--pullspecs", payload_url, "-o", "json"]
+        logger.debug(f"Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+
+    def _is_skipped_image(self, image_name: str) -> bool:
+        """
+        Check if the image name matches any of the skipped images regex patterns.
+
+        Args:
+            image_name (str): The name of the image
+        Returns:
+            bool: True if the image name matches any of the skipped images regex patterns, False otherwise
+        """
+        return any(pattern.fullmatch(image_name) for pattern in self._SKIPPED_IMAGES_PATTERNS)
+
+    def _extract_images(self) -> list[PayloadImage]:
+        """
+        Extract images from the payload data.
+
+        Returns:
+            list[PayloadImage]: List of images
+        """
+        logger.info(f"Extracting images from payload data")
+        images = []
+        for tag in self._payload_data['references']['spec']['tags']:
+            if self._is_skipped_image(tag['name']):
+                logger.info(f"Skipping image - name: {tag['name']}, pullspec: {tag['from']['name']}")
+                continue
+            images.append(PayloadImage(tag['name'], tag['from']['name']))
+            logger.info(f"Adding image - name: {tag['name']}, pullspec: {tag['from']['name']}")
+        logger.info(f"Extracted {len(images)} images from payload data")
+        return images
+
+    def get_images(self) -> list[PayloadImage]:
+        """
+        Get the images from the payload.
+
+        Returns:
+            list[PayloadImage]: List of images
+        """
+        return self._extract_images()
+

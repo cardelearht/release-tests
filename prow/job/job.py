@@ -21,6 +21,12 @@ from urllib3.util import Retry
 class Jobs:
     """Class Jobs handle Prow job by calling the API"""
 
+     # Polling configuration for job readiness checks
+    POLL_MAX_ATTEMPTS = 5
+    POLL_INTERVAL_SECONDS = 5
+
+    IMAGE_CONSISTENCY_CHECK_JOB_NAME = "periodic-ci-openshift-release-tests-master-image-consistency-check"
+
     def __init__(self):
         self.run = False
         self.url = "https://amd64.ocp.releases.ci.openshift.org/api/v1/releasestream/4-stable/tags"
@@ -330,6 +336,69 @@ class Jobs:
                         else:
                             self.run_job(prow_job, None, None, None)
 
+    def _is_valid_payload_url(self, payload_url: str) -> bool:
+        """
+        Validate the payload URL.
+
+        Args:
+            payload_url: The URL of the release payload to check
+
+        Returns:
+            True if the payload URL is valid, False otherwise.
+        """
+
+        pattern = r"^quay\.io/openshift-release-dev/ocp-release:\d+\.\d+\.\d+.*-x86_64$"
+        return re.match(pattern, payload_url) is not None
+
+        
+    def run_image_consistency_check(self, payload_url: str, mr_id: int) -> dict:
+        """
+        Run image consistency check Prow job.
+
+        Args:
+            payload_url: The URL of the release payload to check
+            mr_id: The GitLab merge request ID
+
+        Returns:
+            A dictionary containing the job info.
+        """
+
+        if not self._is_valid_payload_url(payload_url):
+            raise Exception(f"Invalid payload URL: {payload_url}")
+
+        url = self.gangway_url + Jobs.IMAGE_CONSISTENCY_CHECK_JOB_NAME
+        data = {
+            "job_execution_type": "1",
+            "pod_spec_options": {
+                "envs": {
+                    "MULTISTAGE_PARAM_OVERRIDE_PAYLOAD_URL": payload_url,
+                    "MULTISTAGE_PARAM_OVERRIDE_MERGE_REQUEST_ID": str(mr_id),
+                }
+            }
+        }
+
+        # run image consistency check job
+        job_run_res = self._get_session().post(
+            url=url,
+            json=data,
+            headers=self.get_prow_headers()
+        )
+        if job_run_res.status_code != 200:
+            raise Exception(
+                f"Failed to run image consistency check job. "
+                f"Error code: {job_run_res.status_code}, reason: {job_run_res.reason}"
+            )
+
+        # get job id from job run response
+        job_id = json.loads(job_run_res.text)["id"]
+        print(f"Image consistency check job id: {job_id}")
+
+        # get job url from job results
+        job_status = self.get_job_results(job_id, poll=True)
+        print(f"Image consistency check job url: {job_status['jobURL']}")
+
+        return job_status
+
     def run_job(self, job_name, payload, upgrade_from, upgrade_to):
         """Function run Prow job by calling the API"""
 
@@ -352,14 +421,11 @@ class Jobs:
                 headers=self.get_prow_headers(),
             )
             if res.status_code == 200:
-                # print(res.text)
                 job_id = json.loads(res.text)["id"]
                 print(f"Returned job id: {job_id}")
-                # wait 1s for the job startup
-                time.sleep(5)
+
                 try:
-                    self.get_job_results(
-                        job_id, job_name, payload, upgrade_from, upgrade_to)
+                    self.get_job_results(job_id, payload, upgrade_from, upgrade_to, poll=True)
                 except Exception as e:
                     print(f"get job result error: {e}")
             else:
@@ -411,47 +477,90 @@ class Jobs:
                         return periodics_job["name"]
         return None
 
-    def get_job_results(self, job_id, job_name=None, payload=None, upgrade_from=None, upgrade_to=None):
-        """Function get job results"""
-        if job_id:
-            resp = self._get_session().get(url=self.prow_job_url.format(job_id.strip()))
-            if resp.status_code == 200 and resp.text:
-                job_result = yaml.safe_load(resp.text)
-                if job_result:
-                    status = job_result["status"]
-                    spec = job_result["spec"]
-                    job_name = spec["job"]
-                    # it is possible that any of the follow attributes is not in response
-                    # use func `get` to avoid key error
-                    job_url = status.get("url")
-                    job_state = status.get("state")
-                    job_start_time = status.get("startTime")
-                    print(job_name, payload, job_id,
-                          job_start_time, job_url, job_state)
-                    job_dict = {
-                        "jobName": job_name,
-                        "payload": payload,
-                        "upgrade_from": upgrade_from,
-                        "upgrade_to": upgrade_to,
-                        "jobStartTime": job_start_time,
-                        "jobID": job_id,
-                        "jobURL": job_url,
-                        "jobState": job_state,
-                    }
-                    if "completionTime" in status:
-                        job_dict["jobCompletionTime"] = status["completionTime"]
-                    self.save_job_data(job_dict)
-                    print("Done.\n")
-                    return job_dict
-                else:
-                    print("Not found the url link or creationTimestamp...")
-            else:
-                print(
-                    f"return status code:{resp.status_code} reason:{resp.reason}")
-        else:
-            print("No job ID input, exit...")
+    def get_job_results(self, job_id, payload=None, upgrade_from=None, upgrade_to=None, poll=False):
+        """
+        Function get job results from the Prow job API.
+
+        Args:
+            job_id: The ID of the Prow job.
+            payload: The payload of the Prow job.
+            upgrade_from: The original payload of the Prow job.
+            upgrade_to: The target payload of the Prow job.
+            poll: Whether to poll the job results.
+        
+        Returns:
+            A dictionary containing the job info.
+            If poll=False, returns None if job not ready.
+            If poll=True, raises TimeoutError if job not ready after polling.
+        """
+        if not job_id:
+            print(f"No job ID provided. Exiting...")
             sys.exit(0)
 
+        if not poll:
+            return self._fetch_job_info(job_id, payload, upgrade_from, upgrade_to)
+
+        attempt = 0
+
+        while attempt < self.POLL_MAX_ATTEMPTS:
+            attempt += 1
+            result = self._fetch_job_info(job_id, payload, upgrade_from, upgrade_to)
+            if result is not None and result["jobURL"] is not None:
+                return result
+            print(f"Job {job_id} not ready yet, polling... (attempt {attempt})")
+            time.sleep(self.POLL_INTERVAL_SECONDS)
+        
+        timeout_seconds = self.POLL_MAX_ATTEMPTS * self.POLL_INTERVAL_SECONDS
+        raise TimeoutError(f"Job {job_id} not ready after {self.POLL_MAX_ATTEMPTS} attempts ({timeout_seconds}s).")
+
+    def _fetch_job_info(self, job_id, payload=None, upgrade_from=None, upgrade_to=None):
+        """
+        Function fetch job info from the Prow job API.
+
+        Args:
+            job_id: The ID of the Prow job.
+            payload: The payload of the Prow job.
+            upgrade_from: The original payload of the Prow job.
+            upgrade_to: The target payload of the Prow job.
+
+        Returns:
+            A dictionary containing the job info. None if the job info is not found.
+        """
+ 
+        resp = self._get_session().get(url=self.prow_job_url.format(job_id.strip()))
+        if resp.status_code == 200 and resp.text:
+            job_result = yaml.safe_load(resp.text)
+            if job_result:
+                status = job_result["status"]
+                spec = job_result["spec"]
+                job_name = spec["job"]
+                
+                # optional attributes
+                job_url = status.get("url")
+                job_state = status.get("state")
+                job_start_time = status.get("startTime")
+
+                job_info_dict = {
+                    "jobName": job_name,
+                    "payload": payload,
+                    "upgrade_from": upgrade_from,
+                    "upgrade_to": upgrade_to,
+                    "jobStartTime": job_start_time,
+                    "jobID": job_id,
+                    "jobURL": job_url,
+                    "jobState": job_state,
+                }
+                
+                if "completionTime" in status:
+                    job_info_dict["jobCompletionTime"] = status["completionTime"]
+                
+                self.save_job_data(job_info_dict)
+                print(f"Job {job_id} results: {job_info_dict}")
+                return job_info_dict
+            else:
+                print(f"Could not get job results for job ID: {job_id}. Job result is empty.")
+        else:
+            print(f"Could not get job results for job ID: {job_id}. Return status code: {resp.status_code}, reason: {resp.reason}")
         return None
 
     def list_jobs(self, component, branch):
@@ -571,10 +680,11 @@ def cli(debug):
 
 @cli.command("get_results")
 @click.argument("job_id")
+@click.option("--poll/--no-poll", default=False, help="whether to poll the job results.")
 # @click.option('--job_id', help="The Prow job ID.")
-def get_cmd(job_id):
+def get_cmd(job_id, poll):
     """Return the Prow job executed info."""
-    JOB.get_job_results(job_id)
+    JOB.get_job_results(job_id, poll=poll)
 
 
 @cli.command("run")
@@ -643,6 +753,19 @@ def run_z_stream():
      It only used for periodic-ci-openshift-release-tests-master-stable-build-test prow job.
     """
     JOB.run_z_stream_test()
+
+@cli.command("run_image_consistency_check")
+@click.option("-p", "--payload-url", type=str, required=True, help="Payload URL")
+@click.option("-m", "--mr-id", type=int, required=True, help="Merge request ID")
+def run_image_consistency_check(payload_url: str, mr_id: int):
+    """
+    Run image consistency check job
+    
+    Args:
+        payload_url (str): The URL of the payload
+        mr_id (int): The ID of the merge request
+    """
+    JOB.run_image_consistency_check(payload_url, mr_id)
 
 # no need this program entry since this file won't be imported as a module.
 # if __name__ == "__main__":

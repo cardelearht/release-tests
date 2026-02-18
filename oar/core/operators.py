@@ -17,7 +17,7 @@ from oar.core.shipment import ShipmentData
 from oar.core.statebox import StateBox
 from oar.core.worksheet import WorksheetManager
 from oar.core.const import *
-from oar.core.exceptions import ShipmentDataException, WorksheetException
+from oar.core.exceptions import ShipmentDataException, WorksheetException, ConfigStoreException
 from gspread.exceptions import WorksheetNotFound
 
 logger = logging.getLogger(__name__)
@@ -140,10 +140,22 @@ class BugOperator:
 
 class ApprovalOperator:
     """Handles approval operations based on release flow type (errata or konflux)"""
-    
+
     def __init__(self, cs: ConfigStore):
         self._am = AdvisoryManager(cs)
-        self._sd = ShipmentData(cs)
+        self._cs = cs
+
+        # Try to initialize ShipmentData gracefully
+        # For already shipped Konflux releases, MR is merged and ShipmentData will raise exception
+        self._sd = None
+        self._sd_init_error = None
+        if cs.is_konflux_flow():
+            try:
+                self._sd = ShipmentData(cs)
+            except ShipmentDataException as e:
+                # Store the error - "state is not open" means the MR is merged (shipped)
+                self._sd_init_error = str(e)
+                logger.info(f"ShipmentData initialization failed (MR likely merged): {str(e)}")
         
     def _get_scheduler_lock_file(self, minor_release: str) -> str:
         """Get the path for the scheduler lock file for a specific release"""
@@ -202,8 +214,8 @@ class ApprovalOperator:
         try:
             report = WorksheetManager(self._am._cs).get_test_report()
         except WorksheetException as e:
-            # Check if root cause is specifically WorksheetNotFound (expected for StateBox releases)
-            if isinstance(e.__cause__, WorksheetNotFound):
+            # Check if root cause is specifically WorksheetNotFound or ConfigStoreException (expected for StateBox releases)
+            if isinstance(e.__cause__, (WorksheetNotFound, ConfigStoreException)):
                 logger.info(f"Google Sheets worksheet not found (expected for StateBox releases): {e}")
             else:
                 # Other worksheet errors (API failures, network issues) should fail
@@ -386,31 +398,36 @@ class ApprovalOperator:
     def approve_release(self) -> Union[bool, str]:
         """
         Execute approval operations based on release flow type (errata or konflux)
-        
+
         For konflux flow:
-        - Adds QE approval to shipment
+        - Adds QE approval to shipment (if MR is still open)
         - Changes RPM advisory status to REL_PREP only if payload metadata URL is accessible
           for the Y-stream release (e.g. 4.19)
-        
+
         For errata flow:
         - Changes all advisory statuses to REL_PREP
-        
+
         Note: The payload metadata URL check ensures we don't prematurely move advisories
         before the url is accessible.
-        
+
         Returns:
             bool: True if all approvals succeeded, False if payload metadata URL not accessible and scheduler already running
             str: "SCHEDULED" if background job started
-            
+
         Raises:
             Exception: If approval operations fail for either flow type
         """
         try:
             # Only handle shipment approval for konflux flow
-            if self._sd._cs.is_konflux_flow():
-                self._sd.add_qe_approval()
+            if self._cs.is_konflux_flow():
+                # Add QE approval only if MR is still open
+                if self._sd is not None:
+                    self._sd.add_qe_approval()
+                else:
+                    logger.info(f"Shipment MR for {self._cs.release} already merged, skipping QE approval step")
+
                 # only move rpm advisory status when payload metadata url is accessible
-                minor_release = util.get_y_release(self._am._cs.release)
+                minor_release = util.get_y_release(self._cs.release)
                 
                 # Check if metadata URL is accessible immediately
                 if util.is_payload_metadata_url_accessible(minor_release):

@@ -3,7 +3,7 @@
 Release Tests MCP Server
 
 Exposes OAR, oarctl, job, and jobctl commands as MCP tools for use by AI agents.
-Runs in SSE mode - accessible as HTTP server for remote access.
+Runs in HTTP mode - standard MCP transport protocol for remote access.
 
 Performance: Direct Click invocation (NO subprocess overhead)
 - 70-90% faster than subprocess-based approach
@@ -41,7 +41,7 @@ Log Isolation:
 - Each request gets isolated log output even under high load
 
 Tools exposed:
-- 11 OAR CLI commands (create-test-report, take-ownership, update-bug-list, etc.)
+- 8 OAR CLI commands (create-test-report, take-ownership, image-consistency-check, etc.)
 - 2 oarctl commands (start-release-detector, jira-notificator)
 - 6 jobctl commands (start-controller, trigger-jobs-for-build, start-aggregator, etc.)
 - 1 job command (run)
@@ -49,7 +49,7 @@ Tools exposed:
 - 4 issue management tools (add-issue, resolve-issue, get-issues, get-task-blocker)
 - 3 cache management tools (mcp_cache_stats, mcp_cache_invalidate, mcp_cache_warm)
 
-Total: 31 tools (100% optimized - all CLI commands use direct Click invocation)
+Total: 28 tools (100% optimized - all CLI commands use direct Click invocation)
 
 Performance Characteristics:
 - ConfigStore cache hit: <10ms (3x-100x faster than miss)
@@ -71,12 +71,13 @@ import traceback
 from typing import Optional
 from threading import RLock
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from fastmcp import FastMCP
 from cachetools import TTLCache
 from click.testing import CliRunner
+from starlette.responses import JSONResponse
 
 # Import OAR validation
 # Add parent directory to path to import oar modules
@@ -85,7 +86,7 @@ from oar.core.configstore import ConfigStore
 from oar.core.operators import ReleaseShipmentOperator
 from oar.core.worksheet import WorksheetManager
 from oar.core.statebox import StateBox
-from oar.core.exceptions import StateBoxException, WorksheetException
+from oar.core.exceptions import StateBoxException, WorksheetException, ConfigStoreException
 from oar.core.log_capture import capture_logs, merge_output
 from gspread.exceptions import WorksheetNotFound
 from oar.core.const import (
@@ -649,23 +650,6 @@ async def invoke_cli_command_async(command_func, args: list[str]) -> dict:
 # ============================================================================
 
 @mcp.tool()
-async def oar_check_greenwave_cvp_tests(release: str) -> str:
-    """
-    Check Greenwave CVP test status for a z-stream release.
-
-    This is a READ-ONLY operation - it only queries test status.
-
-    Args:
-        release: Z-stream release version (e.g., "4.19.1")
-
-    Returns:
-        Test status information from Greenwave
-    """
-    result = await invoke_oar_command_async(release, "check-greenwave-cvp-tests", [])
-    return format_result(result)
-
-
-@mcp.tool()
 async def oar_check_cve_tracker_bug(release: str, notify: bool = False) -> str:
     """
     Check CVE tracker bug coverage for a z-stream release.
@@ -796,29 +780,6 @@ async def oar_take_ownership(release: str, email: str) -> str:
 
 
 @mcp.tool()
-async def oar_update_bug_list(release: str, notify: bool = True) -> str:
-    """
-    Synchronize bug list from advisory to Jira and Google Sheets.
-
-    ⚠️ WRITE OPERATION: Updates Jira issues and Google Sheets.
-
-    NOTE: This command is not needed in Konflux release flow.
-    Kept for backward compatibility with Errata flow releases.
-    Task status is automatically tracked in StateBox via cli_result_callback.
-
-    Args:
-        release: Z-stream release version (e.g., "4.19.1")
-        notify: Send notifications to bug owners (default: True)
-
-    Returns:
-        Bug synchronization results
-    """
-    args = [] if notify else ["--no-notify"]
-    result = await invoke_oar_command_async(release, "update-bug-list", args)
-    return format_result(result)
-
-
-@mcp.tool()
 async def oar_push_to_cdn_staging(release: str) -> str:
     """
     Push release to CDN staging environment.
@@ -833,23 +794,6 @@ async def oar_push_to_cdn_staging(release: str) -> str:
         CDN push operation results
     """
     result = await invoke_oar_command_async(release, "push-to-cdn-staging", [])
-    return format_result(result)
-
-
-@mcp.tool()
-async def oar_drop_bugs(release: str) -> str:
-    """
-    Remove unverified bugs from advisory.
-
-    ⚠️ WRITE OPERATION: Modifies advisory bug list.
-
-    Args:
-        release: Z-stream release version (e.g., "4.19.1")
-
-    Returns:
-        List of dropped bugs
-    """
-    result = await invoke_oar_command_async(release, "drop-bugs", [])
     return format_result(result)
 
 
@@ -1091,20 +1035,29 @@ async def oar_get_release_metadata(release: str) -> str:
     try:
         cs = get_cached_configstore(release)
 
+        # Build metadata dict with safe fallbacks for optional fields
         metadata = {
             "release": release,
             "advisories": cs.get_advisories() or {},
             "jira_ticket": cs.get_jira_ticket() or "",
             "candidate_builds": cs.get_candidate_builds() or {},
             "shipment_mr": cs.get_shipment_mr() or "",
-            "release_date": cs.get_release_date(),
         }
+
+        # release_date is optional and may not exist for all releases
+        try:
+            metadata["release_date"] = cs.get_release_date()
+        except Exception:
+            metadata["release_date"] = ""
 
         return json.dumps(metadata)
 
     except Exception as e:
         logger.error(f"Failed to get release metadata: {e}")
-        return f"Error: {str(e)}"
+        return json.dumps({
+            "error": str(e),
+            "release": release
+        })
 
 
 @mcp.tool()
@@ -1321,8 +1274,8 @@ async def oar_update_task_status(release: str, task_name: str, status: str, resu
             updated_systems.append("worksheet")
             logger.info(f"Updated Google Sheets for task '{task_name}' to '{status}'")
         except WorksheetException as e:
-            # Check if the root cause is WorksheetNotFound (worksheet doesn't exist)
-            if isinstance(e.__cause__, WorksheetNotFound):
+            # Check if the root cause is WorksheetNotFound or ConfigStoreException (expected for StateBox releases)
+            if isinstance(e.__cause__, (WorksheetNotFound, ConfigStoreException)):
                 logger.info(f"Google Sheets worksheet does not exist for {release} (expected for new releases using StateBox only)")
             else:
                 # Other worksheet errors (API failures, network issues, etc.) should fail
@@ -1824,6 +1777,117 @@ async def oar_get_task_blocker(
 
 
 # ============================================================================
+# Custom HTTP Routes
+# ============================================================================
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """
+    HTTP health check endpoint for monitoring and load balancer compatibility.
+
+    This endpoint provides a standard HTTP health check that can be used by:
+    - Load balancers for liveness checks
+    - Container orchestration systems (Kubernetes/OpenShift)
+    - Monitoring tools (Prometheus, Datadog, etc.)
+    - Manual health verification during debugging
+
+    Returns:
+        JSON response with:
+        - status: "healthy" or "degraded"
+        - server: Server name
+        - version: Server version string
+        - tools: Number of exposed MCP tools
+        - environment: Environment validation status
+        - cache: ConfigStore cache statistics
+        - thread_pool: Thread pool configuration
+        - timestamp: Current UTC timestamp
+
+    Response time: <100ms for quick liveness checks
+    """
+    try:
+        # Validate environment (fast check, uses cached validation results)
+        validation_result = ConfigStore.validate_environment()
+        env_valid = validation_result['valid']
+
+        # Check Kerberos ticket (fast, <10ms)
+        import subprocess
+        krb_valid = False
+        krb_status = "unknown"
+        try:
+            result = subprocess.run(['klist', '-s'], capture_output=True, timeout=1)
+            krb_valid = result.returncode == 0
+            krb_status = "valid" if krb_valid else "no_ticket"
+        except FileNotFoundError:
+            krb_status = "klist_not_found"
+        except subprocess.TimeoutExpired:
+            krb_status = "timeout"
+        except Exception as e:
+            krb_status = f"error: {str(e)}"
+
+        # Get cache statistics (fast, just reads metrics)
+        cache_stats = _configstore_cache.stats()
+
+        # Count tools (fast, just counts registered tools)
+        # Based on server.py: 28 total tools
+        tool_count = 28
+
+        # Determine overall health status
+        # Degraded if env invalid OR kerberos ticket missing
+        status = "healthy" if (env_valid and krb_valid) else "degraded"
+
+        # Build response
+        response = {
+            "status": status,
+            "server": "release-tests-mcp",
+            "version": "1.0.0",
+            "transport": "http",
+            "tools": {
+                "total": tool_count,
+                "cli": 17,  # 8 OAR + 2 oarctl + 6 jobctl + 1 job
+                "api": 11   # 4 config + 4 issue + 3 cache
+            },
+            "environment": {
+                "valid": env_valid,
+                "missing_required": validation_result.get('errors', []),
+                "missing_optional": validation_result.get('missing_optional', [])
+            },
+            "kerberos": {
+                "valid": krb_valid,
+                "status": krb_status
+            },
+            "cache": {
+                "enabled": True,
+                "size": cache_stats['cache_size'],
+                "max_size": cache_stats['max_size'],
+                "hit_rate": cache_stats['metrics']['hit_rate'],
+                "ttl_days": cache_stats['ttl_seconds'] // 86400
+            },
+            "thread_pool": {
+                "size": CLI_THREAD_POOL_SIZE,
+                "cpu_count": os.cpu_count() or "unknown"
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        # Return 200 OK if healthy, 503 Service Unavailable if degraded
+        status_code = 200 if status == "healthy" else 503
+
+        return JSONResponse(content=response, status_code=status_code)
+
+    except Exception as e:
+        # Health check itself failed - return 500 Internal Server Error
+        logger.error(f"Health check failed: {e}", exc_info=True)
+
+        error_response = {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        return JSONResponse(content=error_response, status_code=500)
+
+
+# ============================================================================
 # Server Entry Point
 # ============================================================================
 
@@ -1864,21 +1928,21 @@ if __name__ == "__main__":
     logger.info("Starting Release Tests MCP Server (Optimized)")
     logger.info("=" * 60)
     logger.info(f"✓ Environment validation: PASSED")
-    logger.info(f"✓ Transport: SSE (HTTP)")
+    logger.info(f"✓ Transport: Streamable HTTP")
     logger.info(f"✓ All required credentials configured")
     logger.info(f"✓ Performance: 100% optimized (NO subprocess)")
     logger.info(f"✓ ConfigStore caching: Enabled (TTL=7 days)")
-    logger.info(f"✓ Total tools: 31 (20 CLI + 11 direct API)")
-    logger.info(f"✓ CLI tools: 11 OAR + 2 oarctl + 6 jobctl + 1 job")
+    logger.info(f"✓ Total tools: 28 (17 CLI + 11 direct API)")
+    logger.info(f"✓ CLI tools: 8 OAR + 2 oarctl + 6 jobctl + 1 job")
     logger.info(f"✓ Direct API tools: 4 config + 4 issue + 3 cache")
     logger.info(f"✓ Thread pool: {CLI_THREAD_POOL_SIZE} workers")
     logger.info("=" * 60)
 
     # Run MCP server with graceful shutdown handling
-    # Default: host=127.0.0.1, port=8000
-    # For remote access, override with: mcp.run(transport="sse", host="0.0.0.0", port=8080)
+    # Default: host=127.0.0.1, port=8000, path=/mcp
+    # For remote access, override with: mcp.run(transport="streamable-http", host="0.0.0.0", port=8080)
     try:
-        mcp.run(transport="sse")
+        mcp.run(transport="streamable-http")
     except KeyboardInterrupt:
         logger.info("Received shutdown signal (Ctrl+C)")
     finally:
